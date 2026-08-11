@@ -1,0 +1,26 @@
+### Health
+GET http://localhost:8080/health
+
+### Get a business
+GET http://localhost:8080/api/v1/businesses/biz_1
+
+### List first page of reviews
+GET http://localhost:8080/api/v1/businesses/biz_1/reviews?page=1&limit=2
+
+### Add review
+POST http://localhost:8080/api/v1/businesses/biz_1/reviews
+Content-Type: application/json
+
+{"user_id":"user_99","rating":5,"body":"Great place"}
+
+### Google auth (implementation task)
+POST http://localhost:8080/api/v1/auth/google
+Content-Type: application/json
+
+{"id_token":"replace-with-test-token"}
+
+### Initialize subscription (implementation task)
+POST http://localhost:8080/api/v1/subscriptions/initialize
+Content-Type: application/json
+
+{"user_id":"user_99","email":"candidate@example.com","plan_code":"PLN_mock","amount":500000}
