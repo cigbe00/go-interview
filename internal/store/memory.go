@@ -45,6 +45,9 @@ func NewMemoryStore() *MemoryStore {
 func (s *MemoryStore) GetBusiness(id string) (model.Business, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if b, ok := s.businesses[id]; ok {
+		return b, nil
+	}
 	for _, b := range s.businesses {
 		if b.Slug == id {
 			return b, nil
@@ -64,7 +67,7 @@ func (s *MemoryStore) GetBusinessRaw(id string) (model.Business, error) {
 func (s *MemoryStore) SaveReview(r model.Review) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.collections["review"] = append(s.collections["review"], r)
+	s.collections[ReviewsCollection] = append(s.collections[ReviewsCollection], r)
 	return nil
 }
 func (s *MemoryStore) ListReviews(businessID string, page, limit int) []model.Review {
@@ -77,7 +80,7 @@ func (s *MemoryStore) ListReviews(businessID string, page, limit int) []model.Re
 		}
 	}
 	sort.Slice(matches, func(i, j int) bool { return matches[i].CreatedAt.After(matches[j].CreatedAt) })
-	start := page * limit
+	start := (page - 1) * limit
 	if start >= len(matches) {
 		return []model.Review{}
 	}
@@ -100,23 +103,18 @@ func (s *MemoryStore) ReviewStats(businessID string) (int, float64) {
 	if count == 0 {
 		return 0, 0
 	}
-	return count, float64(total / count)
+	return count, float64(total) / float64(count)
 }
 func (s *MemoryStore) UpsertUser(u model.User) model.User {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for email, existing := range s.users {
-		if existing.GoogleID != "" && u.GoogleID != "" && existing.GoogleID == u.GoogleID {
-			return existing
-		}
-		if email == u.Email {
-			return existing
-		}
+	if existing, ok := s.users[u.GoogleID]; ok && u.GoogleID != "" {
+		return existing
 	}
 	if u.ID == "" {
 		u.ID = "user_" + time.Now().Format("150405.000000")
 	}
-	s.users[u.Email] = u
+	s.users[u.GoogleID] = u
 	return u
 }
 func (s *MemoryStore) PutSubscription(sub model.Subscription) {
@@ -133,12 +131,30 @@ func (s *MemoryStore) GetSubscription(userID string) (model.Subscription, error)
 	}
 	return sub, nil
 }
-func (s *MemoryStore) MarkEventProcessed(id string) bool {
+
+// ApplySubscriptionEvent atomically correlates an event to an initialized
+// subscription and records the event ID. An event is only marked processed
+// after it has been validated and applied.
+func (s *MemoryStore) ApplySubscriptionEvent(eventID, userID, reference, planCode, status string, updatedAt time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.processedEvents[id]; ok {
-		return false
+	if eventID == "" || userID == "" || reference == "" {
+		return ErrNotFound
 	}
-	s.processedEvents[id] = struct{}{}
-	return true
+	if _, ok := s.processedEvents[eventID]; ok {
+		return nil
+	}
+	sub, ok := s.subscriptions[userID]
+	if !ok || sub.Reference != reference {
+		return ErrNotFound
+	}
+	if sub.PlanCode == "" || planCode == "" || sub.PlanCode != planCode {
+		return ErrNotFound
+	}
+	sub.Status = status
+	sub.LastEventID = eventID
+	sub.UpdatedAt = updatedAt
+	s.subscriptions[userID] = sub
+	s.processedEvents[eventID] = struct{}{}
+	return nil
 }

@@ -7,10 +7,12 @@ import (
 	"github.com/maoni/backend-takehome/internal/cache"
 	"github.com/maoni/backend-takehome/internal/model"
 	"github.com/maoni/backend-takehome/internal/store"
+	"strings"
 	"time"
 )
 
 var ErrInvalidRating = errors.New("rating must be between 1 and 5")
+var ErrInvalidReview = errors.New("user_id is required")
 
 type BusinessService struct {
 	Store    *store.MemoryStore
@@ -39,6 +41,11 @@ func (s *BusinessService) CreateReview(ctx context.Context, businessID, userID s
 	if rating < 1 || rating > 5 {
 		return model.Review{}, ErrInvalidRating
 	}
+	userID = strings.TrimSpace(userID)
+	body = strings.TrimSpace(body)
+	if userID == "" {
+		return model.Review{}, ErrInvalidReview
+	}
 	if _, err := s.Store.GetBusinessRaw(businessID); err != nil {
 		return model.Review{}, err
 	}
@@ -46,14 +53,22 @@ func (s *BusinessService) CreateReview(ctx context.Context, businessID, userID s
 	if err := s.Store.SaveReview(r); err != nil {
 		return model.Review{}, err
 	}
+	if s.Cache != nil {
+		// Cache eviction is best effort: the review is authoritative once stored,
+		// and a cache outage must not turn a successful write into an API failure.
+		_ = s.Cache.DeleteBusiness(ctx, businessID)
+	}
 	return r, nil
 }
-func (s *BusinessService) ListReviews(businessID string, page, limit int) []model.Review {
+func (s *BusinessService) ListReviews(businessID string, page, limit int) ([]model.Review, error) {
+	if _, err := s.Store.GetBusinessRaw(businessID); err != nil {
+		return nil, err
+	}
 	if page < 1 {
 		page = 1
 	}
 	if limit < 1 || limit > 100 {
 		limit = 10
 	}
-	return s.Store.ListReviews(businessID, page, limit)
+	return s.Store.ListReviews(businessID, page, limit), nil
 }
