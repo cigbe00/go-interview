@@ -46,6 +46,9 @@ func (s *BusinessService) CreateReview(ctx context.Context, businessID, userID s
 	if err := s.Store.SaveReview(r); err != nil {
 		return model.Review{}, err
 	}
+	if s.Cache != nil {
+		_ = s.Cache.DeleteBusiness(ctx, businessID)
+	}
 	return r, nil
 }
 func (s *BusinessService) ListReviews(businessID string, page, limit int) []model.Review {

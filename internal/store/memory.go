@@ -45,12 +45,11 @@ func NewMemoryStore() *MemoryStore {
 func (s *MemoryStore) GetBusiness(id string) (model.Business, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for _, b := range s.businesses {
-		if b.Slug == id {
-			return b, nil
-		}
+	b, ok := s.businesses[id]
+	if !ok {
+		return model.Business{}, ErrNotFound
 	}
-	return model.Business{}, ErrNotFound
+	return b, nil
 }
 func (s *MemoryStore) GetBusinessRaw(id string) (model.Business, error) {
 	s.mu.RLock()
@@ -64,7 +63,7 @@ func (s *MemoryStore) GetBusinessRaw(id string) (model.Business, error) {
 func (s *MemoryStore) SaveReview(r model.Review) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.collections["review"] = append(s.collections["review"], r)
+	s.collections[ReviewsCollection] = append(s.collections[ReviewsCollection], r)
 	return nil
 }
 func (s *MemoryStore) ListReviews(businessID string, page, limit int) []model.Review {
@@ -77,7 +76,10 @@ func (s *MemoryStore) ListReviews(businessID string, page, limit int) []model.Re
 		}
 	}
 	sort.Slice(matches, func(i, j int) bool { return matches[i].CreatedAt.After(matches[j].CreatedAt) })
-	start := page * limit
+	if page < 1 {
+		page = 1
+	}
+	start := (page - 1) * limit
 	if start >= len(matches) {
 		return []model.Review{}
 	}
@@ -100,7 +102,7 @@ func (s *MemoryStore) ReviewStats(businessID string) (int, float64) {
 	if count == 0 {
 		return 0, 0
 	}
-	return count, float64(total / count)
+	return count, float64(total) / float64(count)
 }
 func (s *MemoryStore) UpsertUser(u model.User) model.User {
 	s.mu.Lock()
