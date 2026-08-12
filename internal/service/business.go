@@ -1,29 +1,41 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"time"
-
+	"github.com/maoni/backend-takehome/internal/cache"
 	"github.com/maoni/backend-takehome/internal/model"
 	"github.com/maoni/backend-takehome/internal/store"
+	"time"
 )
 
 var ErrInvalidRating = errors.New("rating must be between 1 and 5")
 
-type BusinessService struct{ Store *store.MemoryStore }
+type BusinessService struct {
+	Store    *store.MemoryStore
+	Cache    cache.BusinessCache
+	CacheTTL time.Duration
+}
 
-func (s *BusinessService) GetBusiness(id string) (model.Business, error) {
+func (s *BusinessService) GetBusiness(ctx context.Context, id string) (model.Business, error) {
+	if s.Cache != nil {
+		if b, ok, err := s.Cache.GetBusiness(ctx, id); err == nil && ok {
+			return b, nil
+		}
+	}
 	b, err := s.Store.GetBusiness(id)
 	if err != nil {
 		return model.Business{}, err
 	}
 	count, avg := s.Store.ReviewStats(b.ID)
 	b.ReviewCount, b.Average = count, avg
+	if s.Cache != nil {
+		_ = s.Cache.SetBusiness(ctx, b, s.CacheTTL)
+	}
 	return b, nil
 }
-
-func (s *BusinessService) CreateReview(businessID, userID string, rating int, body string) (model.Review, error) {
+func (s *BusinessService) CreateReview(ctx context.Context, businessID, userID string, rating int, body string) (model.Review, error) {
 	if rating < 1 || rating > 5 {
 		return model.Review{}, ErrInvalidRating
 	}
@@ -36,7 +48,6 @@ func (s *BusinessService) CreateReview(businessID, userID string, rating int, bo
 	}
 	return r, nil
 }
-
 func (s *BusinessService) ListReviews(businessID string, page, limit int) []model.Review {
 	if page < 1 {
 		page = 1

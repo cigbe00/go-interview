@@ -1,7 +1,7 @@
 ### Health
 GET http://localhost:8080/health
 
-### Get a business
+### Get seeded business by documented ID
 GET http://localhost:8080/api/v1/businesses/biz_1
 
 ### List first page of reviews
@@ -13,7 +13,10 @@ Content-Type: application/json
 
 {"user_id":"user_99","rating":5,"body":"Great place"}
 
-### Google auth (implementation task)
+### Get business again after creating review
+GET http://localhost:8080/api/v1/businesses/biz_1
+
+### Google auth (implementation task; use tests/mocks rather than real credentials)
 POST http://localhost:8080/api/v1/auth/google
 Content-Type: application/json
 
@@ -24,3 +27,6 @@ POST http://localhost:8080/api/v1/subscriptions/initialize
 Content-Type: application/json
 
 {"user_id":"user_99","email":"candidate@example.com","plan_code":"PLN_mock","amount":500000}
+
+### Read subscription
+GET http://localhost:8080/api/v1/subscriptions/user_99

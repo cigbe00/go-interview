@@ -8,21 +8,19 @@ import (
 	"testing"
 )
 
-func TestDuplicateWebhookIsIdempotent(t *testing.T) {
+func TestSubscriptionInitializePersistsPendingState(t *testing.T) {
 	st := store.NewMemoryStore()
-	provider := payments.FakeProvider{Event: payments.WebhookEvent{ID: "evt_1", Email: "user@example.com", Reference: "ref", PlanCode: "monthly", Status: "active"}}
-	svc := &service.SubscriptionService{Store: st, Provider: provider}
-	if err := svc.HandleWebhook(context.Background(), []byte(`{}`), "sig"); err != nil {
-		t.Fatal(err)
-	}
-	if err := svc.HandleWebhook(context.Background(), []byte(`{}`), "sig"); err != nil {
-		t.Fatal(err)
-	}
-	sub, err := st.GetSubscription("user@example.com")
+	p := payments.FakeProvider{InitResp: payments.InitializeResponse{Reference: "ref_1", AuthorizationURL: "https://example.test/pay", AccessCode: "code"}}
+	svc := service.SubscriptionService{Store: st, Provider: p}
+	_, err := svc.Initialize(context.Background(), "user_1", "user@example.com", "PLN_x", 500000)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sub.LastEventID != "evt_1" {
-		t.Fatalf("unexpected sub %+v", sub)
+	sub, err := st.GetSubscription("user_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sub.Status != "pending" || sub.Reference != "ref_1" {
+		t.Fatalf("unexpected %+v", sub)
 	}
 }

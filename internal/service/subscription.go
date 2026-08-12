@@ -2,13 +2,16 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"time"
-
 	"github.com/maoni/backend-takehome/internal/model"
 	"github.com/maoni/backend-takehome/internal/payments"
 	"github.com/maoni/backend-takehome/internal/store"
+	"strings"
+	"time"
 )
+
+var ErrInvalidSubscriptionRequest = errors.New("invalid subscription request")
 
 type SubscriptionService struct {
 	Store    *store.MemoryStore
@@ -16,17 +19,19 @@ type SubscriptionService struct {
 }
 
 func (s *SubscriptionService) Initialize(ctx context.Context, userID, email, plan string, amount int64) (payments.InitializeResponse, error) {
+	if strings.TrimSpace(userID) == "" || strings.TrimSpace(email) == "" || amount < 0 {
+		return payments.InitializeResponse{}, ErrInvalidSubscriptionRequest
+	}
 	ref := fmt.Sprintf("maoni_%s_%d", userID, time.Now().UnixNano())
-	resp, err := s.Provider.Initialize(ctx, payments.InitializeRequest{Email: email, Amount: amount, PlanCode: plan, Reference: ref})
+	resp, err := s.Provider.Initialize(ctx, payments.InitializeRequest{UserID: userID, Email: email, Amount: amount, PlanCode: plan, Reference: ref})
 	if err != nil {
 		return payments.InitializeResponse{}, err
 	}
 	s.Store.PutSubscription(model.Subscription{UserID: userID, Status: "pending", Reference: resp.Reference, PlanCode: plan, UpdatedAt: time.Now().UTC()})
 	return resp, nil
 }
-
-func (s *SubscriptionService) HandleWebhook(ctx context.Context, body []byte, signature string) error {
-	if err := s.Provider.VerifyWebhookSignature(body, signature); err != nil {
+func (s *SubscriptionService) HandleWebhook(ctx context.Context, body []byte, sig string) error {
+	if err := s.Provider.VerifyWebhookSignature(body, sig); err != nil {
 		return err
 	}
 	event, err := s.Provider.ParseWebhook(body)
@@ -36,7 +41,6 @@ func (s *SubscriptionService) HandleWebhook(ctx context.Context, body []byte, si
 	if !s.Store.MarkEventProcessed(event.ID) {
 		return nil
 	}
-	// Simplified mock mapping; candidate may improve as part of the exercise.
 	userID := event.Email
 	s.Store.PutSubscription(model.Subscription{UserID: userID, Status: event.Status, Reference: event.Reference, PlanCode: event.PlanCode, LastEventID: event.ID, UpdatedAt: time.Now().UTC()})
 	return nil

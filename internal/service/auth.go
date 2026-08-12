@@ -3,14 +3,14 @@ package service
 import (
 	"context"
 	"errors"
-	"strings"
-
 	"github.com/maoni/backend-takehome/internal/auth"
 	"github.com/maoni/backend-takehome/internal/model"
 	"github.com/maoni/backend-takehome/internal/store"
+	"strings"
 )
 
 var ErrEmailMissing = errors.New("verified identity did not include email")
+var ErrSubjectMissing = errors.New("verified identity did not include subject")
 
 type AuthService struct {
 	Store    *store.MemoryStore
@@ -21,12 +21,15 @@ func (s *AuthService) SignInGoogle(ctx context.Context, token string) (model.Use
 	if strings.TrimSpace(token) == "" {
 		return model.User{}, auth.ErrInvalidToken
 	}
-	identity, err := s.Verifier.Verify(ctx, token)
+	id, err := s.Verifier.Verify(ctx, token)
 	if err != nil {
 		return model.User{}, err
 	}
-	if identity.Email == "" {
+	if id.Subject == "" {
+		return model.User{}, ErrSubjectMissing
+	}
+	if id.Email == "" {
 		return model.User{}, ErrEmailMissing
 	}
-	return s.Store.UpsertUser(model.User{Email: identity.Email, Name: identity.Name, GoogleID: identity.Subject}), nil
+	return s.Store.UpsertUser(model.User{Email: id.Email, Name: id.Name, GoogleID: id.Subject}), nil
 }

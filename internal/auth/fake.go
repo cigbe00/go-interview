@@ -7,7 +7,7 @@ type FakeVerifier struct {
 	Err      error
 }
 
-func (f FakeVerifier) Verify(ctx context.Context, idToken string) (Identity, error) {
+func (f FakeVerifier) Verify(context.Context, string) (Identity, error) {
 	if f.Err != nil {
 		return Identity{}, f.Err
 	}

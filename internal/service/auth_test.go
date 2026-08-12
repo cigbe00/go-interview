@@ -8,13 +8,13 @@ import (
 	"testing"
 )
 
-func TestGoogleSignInUsesVerifier(t *testing.T) {
-	svc := &service.AuthService{Store: store.NewMemoryStore(), Verifier: auth.FakeVerifier{Identity: auth.Identity{Subject: "g123", Email: "dev@example.com", Name: "Dev"}}}
+func TestAuthServiceAcceptsVerifiedIdentity(t *testing.T) {
+	svc := service.AuthService{Store: store.NewMemoryStore(), Verifier: auth.FakeVerifier{Identity: auth.Identity{Subject: "google-1", Email: "user@example.com", Name: "Test User"}}}
 	u, err := svc.SignInGoogle(context.Background(), "token")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if u.Email != "dev@example.com" {
-		t.Fatalf("unexpected user: %+v", u)
+	if u.GoogleID != "google-1" {
+		t.Fatalf("unexpected user %+v", u)
 	}
 }

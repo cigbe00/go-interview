@@ -10,8 +10,8 @@ type FakeProvider struct {
 	ParseErr     error
 }
 
-func (f FakeProvider) Initialize(ctx context.Context, req InitializeRequest) (InitializeResponse, error) {
+func (f FakeProvider) Initialize(context.Context, InitializeRequest) (InitializeResponse, error) {
 	return f.InitResp, f.InitErr
 }
-func (f FakeProvider) VerifyWebhookSignature(body []byte, sig string) error { return f.SignatureErr }
-func (f FakeProvider) ParseWebhook(body []byte) (WebhookEvent, error)       { return f.Event, f.ParseErr }
+func (f FakeProvider) VerifyWebhookSignature([]byte, string) error { return f.SignatureErr }
+func (f FakeProvider) ParseWebhook([]byte) (WebhookEvent, error)   { return f.Event, f.ParseErr }
