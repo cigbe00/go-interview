@@ -274,4 +274,4 @@ A small, correct, well-tested change will score higher than a large rewrite.
 
 ## Security and confidentiality
 
-This repository contains no Maoni production data or secrets. Do not add any real production credential to the project. If you choose to use your own provider test credentials for manual exploration, keep them only in your untracked `.env` file.
+This repository contains no Maoni production data or secrets. Do not add any real production credential to the project. If you choose to use your own provider test credentials for manual exploration, keep them only in your untracked `.env` file...
