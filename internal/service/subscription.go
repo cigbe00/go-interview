@@ -38,10 +38,36 @@ func (s *SubscriptionService) HandleWebhook(ctx context.Context, body []byte, si
 	if err != nil {
 		return err
 	}
+	if strings.TrimSpace(event.UserID) == "" {
+		return fmt.Errorf("webhook missing user identity")
+	}
 	if !s.Store.MarkEventProcessed(event.ID) {
 		return nil
 	}
-	userID := event.Email
-	s.Store.PutSubscription(model.Subscription{UserID: userID, Status: event.Status, Reference: event.Reference, PlanCode: event.PlanCode, LastEventID: event.ID, UpdatedAt: time.Now().UTC()})
+	existing, err := s.Store.GetSubscription(event.UserID)
+	if errors.Is(err, store.ErrNotFound) {
+		s.Store.PutSubscription(model.Subscription{
+			UserID:      event.UserID,
+			Status:      event.Status,
+			Reference:   event.Reference,
+			PlanCode:    event.PlanCode,
+			LastEventID: event.ID,
+			UpdatedAt:   time.Now().UTC(),
+		})
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	existing.Status = event.Status
+	existing.LastEventID = event.ID
+	existing.UpdatedAt = time.Now().UTC()
+	if event.Reference != "" {
+		existing.Reference = event.Reference
+	}
+	if event.PlanCode != "" {
+		existing.PlanCode = event.PlanCode
+	}
+	s.Store.PutSubscription(existing)
 	return nil
 }
