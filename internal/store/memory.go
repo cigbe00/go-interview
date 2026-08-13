@@ -213,16 +213,6 @@ func (s *MemoryStore) updateUserLocked(id string, incoming model.User, emailKey 
 	return existing
 }
 
-func (s *MemoryStore) GetUser(id string) (model.User, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	u, ok := s.users[id]
-	if !ok {
-		return model.User{}, ErrNotFound
-	}
-	return u, nil
-}
-
 func (s *MemoryStore) PutSubscription(sub model.Subscription) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

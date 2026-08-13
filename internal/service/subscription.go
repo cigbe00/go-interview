@@ -96,6 +96,13 @@ func (s *SubscriptionService) HandleWebhook(ctx context.Context, body []byte, si
 		return err
 	}
 
+	// Without an idempotency key a retry cannot be distinguished from a new
+	// event. ParseWebhook already enforces this; the check is repeated here so
+	// a future provider implementation cannot quietly disable deduplication.
+	if event.ID == "" {
+		return fmt.Errorf("%w: event has no idempotency key", payments.ErrProvider)
+	}
+
 	existing, err := s.resolveSubscription(event)
 	if err != nil {
 		return err

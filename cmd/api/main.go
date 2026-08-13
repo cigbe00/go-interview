@@ -87,10 +87,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	serverErr := make(chan error, 1)
 	go func() {
 		logger.Info("maoni take-home api listening", "port", cfg.Port)
 		if err := srv.Echo.Start(":" + cfg.Port); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("server stopped", "error", err)
+			serverErr <- err
 			stop()
 		}
 	}()
@@ -100,6 +101,16 @@ func main() {
 	defer cancelShutdown()
 	if err := srv.Echo.Shutdown(shutdownCtx); err != nil {
 		logger.Error("graceful shutdown failed", "error", err)
+	}
+
+	// A server that never came up (a port already in use, for example) must
+	// exit non-zero so a supervisor restarts it instead of treating the
+	// process as a clean shutdown.
+	select {
+	case err := <-serverErr:
+		logger.Error("server failed to start", "error", err)
+		os.Exit(1)
+	default:
 	}
 	logger.Info("shutdown complete")
 }
