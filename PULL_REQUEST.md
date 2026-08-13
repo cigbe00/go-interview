@@ -37,6 +37,9 @@ Each root cause below has a regression test that fails against the original code
 | `MemoryBusinessCache` | Unsynchronised map reachable from concurrent handlers — a data race | Mutex-guarded |
 | Review listing | An unknown business returned `200` with an empty list, indistinguishable from a business with no reviews. Invalid `page`/`limit` were silently coerced | `404` for unknown business; `400` for invalid paging |
 | Review validation | A review could be created with no `user_id` and an unbounded body | `user_id` required, body capped |
+| Cache TTL | `CacheTTL` was passed to Redis unchecked, and go-redis treats a zero expiration as **no expiry**. An unset TTL — or `REDIS_BUSINESS_TTL_SECONDS=0` — would have cached every business permanently, silently removing the backstop that bounds how long a failed invalidation can serve stale data | Non-positive TTL falls back to a positive default |
+| Failed writes | A review write that failed still invalidated the cache, turning a write that never happened into avoidable load on the store | Invalidate only after a successful write |
+| Error leakage | Rejected sign-ins and unprocessable webhooks echoed internal detail (which validation rule failed, parser errors) back to the caller | Fixed client-facing messages; detail is logged |
 | `.env.example` | Referenced by both the README and `make setup`, but absent from the repository | Added |
 
 ---
@@ -53,6 +56,8 @@ Each root cause below has a regression test that fails against the original code
 
 **API layer** ([server.go](internal/api/server.go)): `Recover`, `RequestID` and a body limit; framework errors (404/405/415/body-limit) use the same `{"error": ...}` envelope as handlers; `net/http` status constants instead of magic numbers; internal errors are logged with context and never echoed to the client. The review listing now returns `page`, `limit` and `total` alongside `data` so a client can tell whether another page exists.
 
+**Repository interfaces at the service boundary.** Each service now declares the persistence surface it needs (`BusinessRepository`, `SubscriptionRepository`, `UserRepository`) at the point of use, rather than depending on the concrete mock store. This is what "repository" in handler/service/repository actually buys: a MongoDB implementation becomes a drop-in, and failure modes the in-memory store *cannot produce* — write-concern errors, server-selection timeouts — become testable. That boundary is what surfaced the cache-TTL and failed-write defects above. `cmd/api` asserts at compile time that the mock store satisfies all three.
+
 **Everything else stayed put.** Echo, the handler/service/store split, the existing interfaces and the mock store are unchanged. `GetBusiness` and `GetBusinessRaw` are now the same lookup; I left both because the provided starter test depends on `GetBusinessRaw`.
 
 ---
@@ -68,7 +73,33 @@ Starter tests still pass unchanged. The whole suite passes under `-race`.
 - **`internal/api`** — end-to-end over `httptest`, including the full reported symptom (create a review, read the business back, see fresh aggregates), paging metadata, validation status codes, auth 401-vs-502 mapping, and webhook handling with **real** signature verification: signed delivery applied, 64 KiB body and chunked body with no `Content-Length` both accepted (the body-read regression), unsigned and tampered deliveries rejected, duplicate delivery acknowledged but not re-applied.
 - **`internal/rediscache`** — optional integration tests against the local Docker Redis: round trip preserving derived fields, TTL expiry, and invalidation-on-write against real Redis. They skip when Redis is unreachable or under `-short`, so `go test ./...` stays green without Docker.
 
+- **`internal/api` (end to end)** — `TestSignUpToActiveSubscriptionJourney` and `TestReviewLifecycleJourney` drive the application the way a client does: over HTTP, through the real router, services, store and cache, with the **real** Google verifier and the **real** Paystack client. Only the two external HTTP endpoints are stood in for, so token validation, signature verification, idempotency and cache invalidation are genuinely exercised rather than faked. The journey covers first sign-in, an email change keeping the same account, four classes of rejected token, checkout reaching Paystack with the right auth and metadata, a tampered webhook, activation, triple redelivery, cancellation preserving correlation data, and another user's callback failing to touch the subscription. The review journey asserts exact aggregates after *every* write and that paging covers every record exactly once.
+- **Concurrency (`internal/service`, `internal/api`)** — run under `-race`: 32 simultaneous redeliveries of one webhook apply exactly once; 16 distinct concurrent events all apply; 40 concurrent review writes leave exact aggregates and no lost records; mixed traffic across every endpoint never returns 5xx.
+- **`internal/config`** — defaults, environment overrides, malformed numbers falling back rather than becoming zero, `.env` parsing including quoted values, and a real environment variable winning over the file.
+
 No test requires network access or real credentials.
+
+### Verifying the tests actually catch the bugs
+
+A test that never fails proves nothing, so I re-introduced each defect and confirmed the suite goes red. All 15 mutations were caught:
+
+| Mutation | Caught |
+|---|---|
+| Business lookup back to matching on `Slug` | ✅ |
+| Review saved to the `"review"` collection again | ✅ |
+| `float64(total / count)` integer division restored | ✅ |
+| Pagination offset back to `page * limit` | ✅ |
+| Sort tiebreaker removed (unstable ordering) | ✅ |
+| Cache invalidation on write removed | ✅ |
+| Webhook body back to `Content-Length` + single `Read` | ✅ |
+| Webhook identity resolved from customer email | ✅ |
+| Idempotency claim removed | ✅ |
+| Event claimed before it resolves | ✅ |
+| HMAC signature comparison bypassed | ✅ |
+| Google audience check bypassed | ✅ |
+| Google expiry check bypassed | ✅ |
+| Unverified email accepted | ✅ |
+| Zero cache TTL passed through to Redis | ✅ |
 
 ---
 
@@ -93,6 +124,7 @@ No test requires network access or real credentials.
 - **Concurrent webhooks for the same user read-modify-write the subscription.** Deduplication is atomic (a single claim per event ID), but two *different* events arriving at once both read the current record and the later write wins. The mock store has no transactions; against Mongo this is a single conditional update rather than read-then-write.
 - **Webhook ordering.** Events carry no local sequence, so an out-of-order delivery (a stale `charge.success` arriving after `subscription.disable`) would apply the older state. Production needs the provider timestamp compared against `updated_at`, or a state machine that refuses invalid transitions.
 - **`GetBusiness` and `GetBusinessRaw` are now duplicates**; I left both to keep the starter test compiling. They should collapse into one method.
+- **The repository interfaces mirror the mock store's signatures**, so `PutSubscription` and `MarkEventProcessed` return no error. A MongoDB implementation would need error returns on both, and `MarkEventProcessed` would become an upsert against a unique index rather than a map write.
 - **Subscription lifecycle is a single record per user**, so historical transitions are not retained. A real implementation wants an append-only subscription-event log.
 - The idempotency set grows unbounded in memory; in Mongo this would be a collection with a unique index on the event ID and a TTL index to expire old keys.
 

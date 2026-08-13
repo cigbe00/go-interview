@@ -4,8 +4,17 @@ GET http://localhost:8080/health
 ### Get seeded business by documented ID
 GET http://localhost:8080/api/v1/businesses/biz_1
 
-### List first page of reviews
+### Unknown business -> 404
+GET http://localhost:8080/api/v1/businesses/does-not-exist
+
+### List first page of reviews (newest first; response carries page/limit/total)
 GET http://localhost:8080/api/v1/businesses/biz_1/reviews?page=1&limit=2
+
+### Second page - no record is skipped or repeated between pages
+GET http://localhost:8080/api/v1/businesses/biz_1/reviews?page=2&limit=2
+
+### Invalid paging -> 400 rather than a silently coerced page
+GET http://localhost:8080/api/v1/businesses/biz_1/reviews?page=0
 
 ### Add review
 POST http://localhost:8080/api/v1/businesses/biz_1/reviews
@@ -14,15 +23,35 @@ Content-Type: application/json
 {"user_id":"user_99","rating":5,"body":"Great place"}
 
 ### Get business again after creating review
+### review_count and average_rating reflect the new review immediately
 GET http://localhost:8080/api/v1/businesses/biz_1
 
-### Google auth (implementation task; use tests/mocks rather than real credentials)
+### Invalid rating -> 400
+POST http://localhost:8080/api/v1/businesses/biz_1/reviews
+Content-Type: application/json
+
+{"user_id":"user_99","rating":9,"body":"Out of range"}
+
+### Missing user_id -> 400
+POST http://localhost:8080/api/v1/businesses/biz_1/reviews
+Content-Type: application/json
+
+{"rating":5,"body":"Anonymous"}
+
+### Google auth
+### Needs GOOGLE_CLIENT_ID set and a token whose audience matches it.
+### Without valid credentials this returns 401 (bad token) or 502 (provider
+### unreachable). The verifier is covered end to end by the tests in
+### internal/auth and internal/api instead.
 POST http://localhost:8080/api/v1/auth/google
 Content-Type: application/json
 
 {"id_token":"replace-with-test-token"}
 
-### Initialize subscription (implementation task)
+### Initialize subscription
+### Needs PAYSTACK_SECRET_KEY. Point PAYSTACK_BASE_URL at a local stub to try
+### this without calling Paystack. The response reference is what correlates
+### the later webhook back to this user.
 POST http://localhost:8080/api/v1/subscriptions/initialize
 Content-Type: application/json
 
@@ -30,3 +59,22 @@ Content-Type: application/json
 
 ### Read subscription
 GET http://localhost:8080/api/v1/subscriptions/user_99
+
+### Webhook
+### The signature is HMAC-SHA512 of the exact request body, keyed with
+### PAYSTACK_SECRET_KEY, so it cannot be written by hand. Generate one with:
+###
+###   BODY='{"event":"charge.success","data":{"id":42,"reference":"<reference>","status":"success","customer":{"email":"candidate@example.com"},"plan":{"plan_code":"PLN_mock"},"metadata":{"user_id":"user_99"}}}'
+###   SIG=$(printf '%s' "$BODY" | openssl dgst -sha512 -hmac "$PAYSTACK_SECRET_KEY" | awk '{print $2}')
+###   curl -i -X POST http://localhost:8080/api/v1/subscriptions/webhook \
+###     -H "Content-Type: application/json" -H "x-paystack-signature: $SIG" -d "$BODY"
+###
+### Replace <reference> with the reference returned by the initialize call.
+### Sending the same body twice is safe: the second delivery is acknowledged
+### but not applied again.
+
+### Webhook with no signature -> 401
+POST http://localhost:8080/api/v1/subscriptions/webhook
+Content-Type: application/json
+
+{"event":"charge.success","data":{"id":42,"reference":"maoni_user_99_1","status":"success"}}
