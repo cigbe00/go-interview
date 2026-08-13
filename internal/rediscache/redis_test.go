@@ -3,6 +3,7 @@ package rediscache_test
 import (
 	"context"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -12,6 +13,11 @@ import (
 	"github.com/maoni/backend-takehome/internal/service"
 	"github.com/maoni/backend-takehome/internal/store"
 )
+
+// testRedisDB keeps integration tests off database 0. Whatever Redis happens
+// to be listening locally may not be the one from docker-compose.yml, and test
+// keys should not land in someone's working data. Override with REDIS_TEST_DB.
+const testRedisDB = 15
 
 // newRedisCache connects to the local Docker Redis from docker-compose.yml.
 // The test is skipped when Redis is not running, so `go test ./...` stays green
@@ -25,8 +31,16 @@ func newRedisCache(t *testing.T) *rediscache.BusinessCache {
 	if addr == "" {
 		addr = "localhost:6379"
 	}
+	db := testRedisDB
+	if raw := os.Getenv("REDIS_TEST_DB"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			t.Fatalf("REDIS_TEST_DB=%q is not a number", raw)
+		}
+		db = parsed
+	}
 
-	rc := rediscache.New(addr, os.Getenv("REDIS_PASSWORD"), 0)
+	rc := rediscache.New(addr, os.Getenv("REDIS_PASSWORD"), db)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if err := rc.Ping(ctx); err != nil {
