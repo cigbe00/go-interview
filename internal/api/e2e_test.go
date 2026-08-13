@@ -40,9 +40,12 @@ type e2eEnv struct {
 	client   *http.Client
 	baseURL  string
 	store    *store.MemoryStore
-	cache    *cache.MemoryBusinessCache
 	paystack *fakePaystack
 	google   *fakeGoogle
+	// auth and subs are exposed so a test can swap in a double for a failure
+	// mode the fake provider servers cannot produce.
+	auth *service.AuthService
+	subs *service.SubscriptionService
 }
 
 // fakeGoogle stands in for oauth2.googleapis.com/tokeninfo. Tokens it does not
@@ -134,7 +137,9 @@ func (p *fakePaystack) lastRequest(t *testing.T) (map[string]any, string) {
 	return p.requests[len(p.requests)-1], p.authHdrs[len(p.authHdrs)-1]
 }
 
-func newE2E(t *testing.T) *e2eEnv {
+func newE2E(t *testing.T) *e2eEnv { return newE2EWithRedis(t, false) }
+
+func newE2EWithRedis(t *testing.T, redisHealthy bool) *e2eEnv {
 	t.Helper()
 	google := newFakeGoogle(t)
 	paystack := newFakePaystack(t)
@@ -142,26 +147,28 @@ func newE2E(t *testing.T) *e2eEnv {
 	st := store.NewMemoryStore()
 	businessCache := cache.NewMemoryBusinessCache()
 
+	authSvc := &service.AuthService{Store: st, Verifier: &auth.GoogleVerifier{
+		ClientID:     e2eClientID,
+		TokenInfoURL: google.server.URL + "/tokeninfo",
+		HTTPClient:   &http.Client{Timeout: 2 * time.Second},
+	}}
+	subs := &service.SubscriptionService{Store: st, Provider: &payments.PaystackClient{
+		SecretKey:  e2eSecret,
+		BaseURL:    paystack.server.URL,
+		HTTPClient: &http.Client{Timeout: 2 * time.Second},
+	}}
 	srv := api.New(
 		&service.BusinessService{Store: st, Cache: businessCache, CacheTTL: time.Minute},
-		&service.AuthService{Store: st, Verifier: &auth.GoogleVerifier{
-			ClientID:     e2eClientID,
-			TokenInfoURL: google.server.URL + "/tokeninfo",
-			HTTPClient:   &http.Client{Timeout: 2 * time.Second},
-		}},
-		&service.SubscriptionService{Store: st, Provider: &payments.PaystackClient{
-			SecretKey:  e2eSecret,
-			BaseURL:    paystack.server.URL,
-			HTTPClient: &http.Client{Timeout: 2 * time.Second},
-		}},
-		func() bool { return false },
+		authSvc, subs,
+		func() bool { return redisHealthy },
 	)
 	ts := httptest.NewServer(srv.Echo)
 	t.Cleanup(ts.Close)
 
 	return &e2eEnv{
 		t: t, client: ts.Client(), baseURL: ts.URL,
-		store: st, cache: businessCache, paystack: paystack, google: google,
+		store: st, paystack: paystack, google: google,
+		auth: authSvc, subs: subs,
 	}
 }
 
@@ -171,7 +178,15 @@ func (e *e2eEnv) request(method, path string, body []byte, headers map[string]st
 	if body != nil {
 		reader = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(context.Background(), method, e.baseURL+path, reader)
+	return e.requestReader(method, path, reader, headers)
+}
+
+// requestReader sends an arbitrary reader as the body. Passing a reader whose
+// concrete type net/http cannot size (io.NopCloser, say) makes it send the
+// request chunked, which is what the webhook framing test needs.
+func (e *e2eEnv) requestReader(method, path string, body io.Reader, headers map[string]string) (int, map[string]any, http.Header) {
+	e.t.Helper()
+	req, err := http.NewRequestWithContext(context.Background(), method, e.baseURL+path, body)
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -195,6 +210,17 @@ func (e *e2eEnv) request(method, path string, body []byte, headers map[string]st
 		}
 	}
 	return resp.StatusCode, decoded, resp.Header
+}
+
+// seedPendingSubscription drives the real checkout path and returns the
+// transaction reference Paystack echoed back.
+func (e *e2eEnv) seedPendingSubscription(t *testing.T, userID string) string {
+	t.Helper()
+	resp, err := e.subs.Initialize(context.Background(), userID, "user@example.com", "PLN_x", 500000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp.Reference
 }
 
 func e2eSign(body []byte) string {
@@ -517,5 +543,3 @@ func intOf(v any) (int, bool) {
 	f, ok := v.(float64)
 	return int(f), ok
 }
-
-func jsonPayload(v map[string]any) ([]byte, error) { return json.Marshal(v) }

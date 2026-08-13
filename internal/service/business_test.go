@@ -12,23 +12,6 @@ import (
 	"github.com/maoni/backend-takehome/internal/store"
 )
 
-// failingCache simulates a Redis outage on every operation.
-type failingCache struct {
-	err     error
-	deletes int
-}
-
-func (f *failingCache) GetBusiness(context.Context, string) (model.Business, bool, error) {
-	return model.Business{}, false, f.err
-}
-func (f *failingCache) SetBusiness(context.Context, model.Business, time.Duration) error {
-	return f.err
-}
-func (f *failingCache) DeleteBusiness(context.Context, string) error {
-	f.deletes++
-	return f.err
-}
-
 func newBusinessService(t *testing.T, c cache.BusinessCache) (*service.BusinessService, *store.MemoryStore) {
 	t.Helper()
 	st := store.NewMemoryStore()
@@ -132,7 +115,7 @@ func TestGetBusinessServesAndRepopulatesCache(t *testing.T) {
 // A transient cache failure must degrade to the store, never turn into a
 // failed request or a lost write.
 func TestCacheOutageDoesNotCorruptOrFailRequests(t *testing.T) {
-	fc := &failingCache{err: errors.New("redis: connection refused")}
+	fc := newFailingCache(errors.New("redis: connection refused"))
 	svc, st := newBusinessService(t, fc)
 	ctx := context.Background()
 

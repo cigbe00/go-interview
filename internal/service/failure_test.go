@@ -20,46 +20,55 @@ type stubBusinessRepo struct {
 	business model.Business
 	getErr   error
 	saveErr  error
-	saved    int
 }
 
 func (s *stubBusinessRepo) GetBusiness(string) (model.Business, error) {
 	return s.business, s.getErr
 }
-func (s *stubBusinessRepo) SaveReview(model.Review) error {
-	if s.saveErr != nil {
-		return s.saveErr
-	}
-	s.saved++
-	return nil
-}
+func (s *stubBusinessRepo) SaveReview(model.Review) error { return s.saveErr }
 func (s *stubBusinessRepo) ListReviews(string, int, int) ([]model.Review, int) {
 	return []model.Review{}, 0
 }
 func (s *stubBusinessRepo) ReviewStats(string) (int, float64) { return 0, 0 }
 
-// recordingCache captures what the service asks the cache to do.
-type recordingCache struct {
+// spyCache records what the service asks the cache to do, and can be told to
+// fail every operation so a Redis outage can be simulated.
+type spyCache struct {
 	entries map[string]model.Business
 	ttls    []time.Duration
 	deletes int
+	err     error
 }
 
-func newRecordingCache() *recordingCache {
-	return &recordingCache{entries: map[string]model.Business{}}
+func newSpyCache() *spyCache { return &spyCache{entries: map[string]model.Business{}} }
+
+func newFailingCache(err error) *spyCache {
+	c := newSpyCache()
+	c.err = err
+	return c
 }
-func (r *recordingCache) GetBusiness(_ context.Context, id string) (model.Business, bool, error) {
-	b, ok := r.entries[id]
+
+func (c *spyCache) GetBusiness(_ context.Context, id string) (model.Business, bool, error) {
+	if c.err != nil {
+		return model.Business{}, false, c.err
+	}
+	b, ok := c.entries[id]
 	return b, ok, nil
 }
-func (r *recordingCache) SetBusiness(_ context.Context, b model.Business, ttl time.Duration) error {
-	r.ttls = append(r.ttls, ttl)
-	r.entries[b.ID] = b
+func (c *spyCache) SetBusiness(_ context.Context, b model.Business, ttl time.Duration) error {
+	c.ttls = append(c.ttls, ttl)
+	if c.err != nil {
+		return c.err
+	}
+	c.entries[b.ID] = b
 	return nil
 }
-func (r *recordingCache) DeleteBusiness(_ context.Context, id string) error {
-	r.deletes++
-	delete(r.entries, id)
+func (c *spyCache) DeleteBusiness(_ context.Context, id string) error {
+	c.deletes++
+	if c.err != nil {
+		return c.err
+	}
+	delete(c.entries, id)
 	return nil
 }
 
@@ -67,7 +76,7 @@ func (r *recordingCache) DeleteBusiness(_ context.Context, id string) error {
 func TestCreateReviewSurfacesStoreFailure(t *testing.T) {
 	writeErr := errors.New("write concern error: not enough replicas")
 	repo := &stubBusinessRepo{business: model.Business{ID: "biz_1"}, saveErr: writeErr}
-	c := newRecordingCache()
+	c := newSpyCache()
 	svc := &service.BusinessService{Store: repo, Cache: c, CacheTTL: time.Minute}
 
 	_, err := svc.CreateReview(context.Background(), "biz_1", "user_9", 5, "Great")
@@ -85,7 +94,7 @@ func TestCreateReviewSurfacesStoreFailure(t *testing.T) {
 // business — that would turn an outage into a silent 404.
 func TestGetBusinessSurfacesStoreFailure(t *testing.T) {
 	readErr := errors.New("server selection timeout")
-	svc := &service.BusinessService{Store: &stubBusinessRepo{getErr: readErr}, Cache: newRecordingCache()}
+	svc := &service.BusinessService{Store: &stubBusinessRepo{getErr: readErr}, Cache: newSpyCache()}
 
 	_, err := svc.GetBusiness(context.Background(), "biz_1")
 	if !errors.Is(err, readErr) {
@@ -107,7 +116,7 @@ func TestCacheTTLIsNeverZero(t *testing.T) {
 	repo := &stubBusinessRepo{business: model.Business{ID: "biz_1"}}
 
 	t.Run("unset TTL falls back to a positive default", func(t *testing.T) {
-		c := newRecordingCache()
+		c := newSpyCache()
 		svc := &service.BusinessService{Store: repo, Cache: c} // CacheTTL left at zero
 		if _, err := svc.GetBusiness(context.Background(), "biz_1"); err != nil {
 			t.Fatal(err)
@@ -121,7 +130,7 @@ func TestCacheTTLIsNeverZero(t *testing.T) {
 	})
 
 	t.Run("negative TTL falls back too", func(t *testing.T) {
-		c := newRecordingCache()
+		c := newSpyCache()
 		svc := &service.BusinessService{Store: repo, Cache: c, CacheTTL: -time.Second}
 		if _, err := svc.GetBusiness(context.Background(), "biz_1"); err != nil {
 			t.Fatal(err)
@@ -132,7 +141,7 @@ func TestCacheTTLIsNeverZero(t *testing.T) {
 	})
 
 	t.Run("configured TTL is honoured", func(t *testing.T) {
-		c := newRecordingCache()
+		c := newSpyCache()
 		svc := &service.BusinessService{Store: repo, Cache: c, CacheTTL: 90 * time.Second}
 		if _, err := svc.GetBusiness(context.Background(), "biz_1"); err != nil {
 			t.Fatal(err)

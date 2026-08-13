@@ -146,7 +146,11 @@ func (p *PaystackClient) Initialize(ctx context.Context, in InitializeRequest) (
 	}
 	// A 200 with status:false is a provider-declared failure.
 	if !env.Status {
-		return InitializeResponse{}, fmt.Errorf("%w: %s", ErrProvider, fallback(env.Message, "initialization declined"))
+		message := env.Message
+		if strings.TrimSpace(message) == "" {
+			message = "initialization declined"
+		}
+		return InitializeResponse{}, fmt.Errorf("%w: %s", ErrProvider, message)
 	}
 	if env.Data.AuthorizationURL == "" || env.Data.Reference == "" {
 		return InitializeResponse{}, fmt.Errorf("%w: response missing authorization_url or reference", ErrProvider)
@@ -315,11 +319,4 @@ func (p *PaystackClient) httpClient() *http.Client {
 		return p.HTTPClient
 	}
 	return &http.Client{Timeout: defaultProviderTimeout}
-}
-
-func fallback(v, def string) string {
-	if strings.TrimSpace(v) == "" {
-		return def
-	}
-	return v
 }

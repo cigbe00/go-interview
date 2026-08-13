@@ -2,6 +2,7 @@ package api_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -84,7 +85,7 @@ func TestReviewBodyHandlesUnicode(t *testing.T) {
 	e := newE2E(t)
 	const body = "Great jollof 🍚 — ₦5,000 well spent. \"Best\" in Lagos.\nNewline too."
 
-	payload, err := jsonPayload(map[string]any{"user_id": "user_1", "rating": 5, "body": body})
+	payload, err := json.Marshal(map[string]any{"user_id": "user_1", "rating": 5, "body": body})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -2,122 +2,39 @@ package api_test
 
 import (
 	"bytes"
-	"context"
-	"crypto/hmac"
-	"crypto/sha512"
-	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/maoni/backend-takehome/internal/api"
 	"github.com/maoni/backend-takehome/internal/auth"
-	"github.com/maoni/backend-takehome/internal/cache"
 	"github.com/maoni/backend-takehome/internal/payments"
-	"github.com/maoni/backend-takehome/internal/service"
-	"github.com/maoni/backend-takehome/internal/store"
 )
 
-const webhookSecret = "sk_test_not_a_real_key"
-
-type harness struct {
-	t     *testing.T
-	url   string
-	store *store.MemoryStore
-	auth  *service.AuthService
-	subs  *service.SubscriptionService
-}
-
-func newHarness(t *testing.T) *harness {
-	t.Helper()
-	st := store.NewMemoryStore()
-	authSvc := &service.AuthService{
-		Store:    st,
-		Verifier: auth.FakeVerifier{Identity: auth.Identity{Subject: "google-1", Email: "user@example.com", Name: "Test User"}},
-	}
-	// A real Paystack client so signature verification and payload parsing are
-	// exercised end to end; only the network call in Initialize is faked.
-	subs := &service.SubscriptionService{Store: st, Provider: &payments.PaystackClient{SecretKey: webhookSecret}}
-	srv := api.New(
-		&service.BusinessService{Store: st, Cache: cache.NewMemoryBusinessCache(), CacheTTL: time.Minute},
-		authSvc, subs, func() bool { return true },
-	)
-	ts := httptest.NewServer(srv.Echo)
-	t.Cleanup(ts.Close)
-	return &harness{t: t, url: ts.URL, store: st, auth: authSvc, subs: subs}
-}
-
-func (h *harness) do(method, path string, body io.Reader, headers map[string]string) (int, []byte) {
-	h.t.Helper()
-	req, err := http.NewRequestWithContext(context.Background(), method, h.url+path, body)
-	if err != nil {
-		h.t.Fatal(err)
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		h.t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		h.t.Fatal(err)
-	}
-	return resp.StatusCode, raw
-}
-
-func (h *harness) getJSON(path string) (int, map[string]any) {
-	h.t.Helper()
-	status, raw := h.do(http.MethodGet, path, nil, nil)
-	var out map[string]any
-	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &out); err != nil {
-			h.t.Fatalf("GET %s returned non-JSON %q: %v", path, raw, err)
-		}
-	}
-	return status, out
-}
-
-func (h *harness) postJSON(path, body string) (int, map[string]any) {
-	h.t.Helper()
-	status, raw := h.do(http.MethodPost, path, strings.NewReader(body), nil)
-	var out map[string]any
-	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &out); err != nil {
-			h.t.Fatalf("POST %s returned non-JSON %q: %v", path, raw, err)
-		}
-	}
-	return status, out
-}
+// Handler-level tests. They share the harness in e2e_test.go rather than
+// standing up a second one; the end-to-end journeys there cover the happy
+// paths, so these concentrate on status codes, validation and framing.
 
 func TestHealth(t *testing.T) {
-	h := newHarness(t)
-	status, body := h.getJSON("/health")
+	e := newE2EWithRedis(t, true)
+	status, body, _ := e.request(http.MethodGet, "/health", nil, nil)
 	if status != http.StatusOK || body["status"] != "ok" || body["redis"] != true {
 		t.Fatalf("status=%d body=%v", status, body)
 	}
 }
 
 func TestGetBusinessByDocumentedID(t *testing.T) {
-	h := newHarness(t)
+	e := newE2E(t)
 
-	status, body := h.getJSON("/api/v1/businesses/biz_1")
+	status, body, _ := e.request(http.MethodGet, "/api/v1/businesses/biz_1", nil, nil)
 	if status != http.StatusOK {
 		t.Fatalf("status = %d, want 200", status)
 	}
 	if body["id"] != "biz_1" || body["name"] != "Lagos Bistro" {
 		t.Fatalf("unexpected body %v", body)
 	}
-	if count, _ := body["review_count"].(float64); int(count) != 3 {
+	if count, _ := intOf(body["review_count"]); count != 3 {
 		t.Fatalf("review_count = %v, want 3", body["review_count"])
 	}
 	// 5+4+4 over three reviews: the average must not be truncated to 4.
@@ -125,7 +42,7 @@ func TestGetBusinessByDocumentedID(t *testing.T) {
 		t.Fatalf("average_rating = %v, want ~4.333", body["average_rating"])
 	}
 
-	if status, _ := h.getJSON("/api/v1/businesses/nope"); status != http.StatusNotFound {
+	if status, _, _ := e.request(http.MethodGet, "/api/v1/businesses/nope", nil, nil); status != http.StatusNotFound {
 		t.Fatalf("unknown business status = %d, want 404", status)
 	}
 }
@@ -133,13 +50,14 @@ func TestGetBusinessByDocumentedID(t *testing.T) {
 // The full reported symptom, over HTTP: create a review, then read the
 // business back and see the new aggregates rather than a cached copy.
 func TestCreateReviewIsReflectedInBusinessImmediately(t *testing.T) {
-	h := newHarness(t)
+	e := newE2E(t)
 
-	if status, _ := h.getJSON("/api/v1/businesses/biz_1"); status != http.StatusOK {
+	if status, _, _ := e.request(http.MethodGet, "/api/v1/businesses/biz_1", nil, nil); status != http.StatusOK {
 		t.Fatalf("warm-up read status = %d", status)
 	}
 
-	status, created := h.postJSON("/api/v1/businesses/biz_1/reviews", `{"user_id":"user_99","rating":1,"body":"Not great"}`)
+	status, created, _ := e.request(http.MethodPost, "/api/v1/businesses/biz_1/reviews",
+		[]byte(`{"user_id":"user_99","rating":1,"body":"Not great"}`), nil)
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want 201: %v", status, created)
 	}
@@ -147,8 +65,8 @@ func TestCreateReviewIsReflectedInBusinessImmediately(t *testing.T) {
 		t.Fatalf("unexpected review %v", created)
 	}
 
-	_, body := h.getJSON("/api/v1/businesses/biz_1")
-	if count, _ := body["review_count"].(float64); int(count) != 4 {
+	_, body, _ := e.request(http.MethodGet, "/api/v1/businesses/biz_1", nil, nil)
+	if count, _ := intOf(body["review_count"]); count != 4 {
 		t.Fatalf("review_count = %v, want 4 (stale cache?)", body["review_count"])
 	}
 	if avg, _ := body["average_rating"].(float64); avg != 3.5 {
@@ -157,9 +75,9 @@ func TestCreateReviewIsReflectedInBusinessImmediately(t *testing.T) {
 }
 
 func TestListReviewsPagination(t *testing.T) {
-	h := newHarness(t)
+	e := newE2E(t)
 
-	status, body := h.getJSON("/api/v1/businesses/biz_1/reviews?page=1&limit=2")
+	status, body, _ := e.request(http.MethodGet, "/api/v1/businesses/biz_1/reviews?page=1&limit=2", nil, nil)
 	if status != http.StatusOK {
 		t.Fatalf("status = %d, want 200", status)
 	}
@@ -171,25 +89,25 @@ func TestListReviewsPagination(t *testing.T) {
 	if first["id"] != "rev_3" {
 		t.Fatalf("page 1 starts at %v, want the newest review rev_3", first["id"])
 	}
-	if total, _ := body["total"].(float64); int(total) != 3 {
+	if total, _ := intOf(body["total"]); total != 3 {
 		t.Fatalf("total = %v, want 3", body["total"])
 	}
 
-	_, page2 := h.getJSON("/api/v1/businesses/biz_1/reviews?page=2&limit=2")
+	_, page2, _ := e.request(http.MethodGet, "/api/v1/businesses/biz_1/reviews?page=2&limit=2", nil, nil)
 	data2, _ := page2["data"].([]any)
 	if len(data2) != 1 {
 		t.Fatalf("page 2 returned %d reviews, want 1", len(data2))
 	}
 
 	// Defaults apply when the parameters are omitted.
-	_, defaults := h.getJSON("/api/v1/businesses/biz_1/reviews")
+	_, defaults, _ := e.request(http.MethodGet, "/api/v1/businesses/biz_1/reviews", nil, nil)
 	if len(defaults["data"].([]any)) != 3 {
 		t.Fatalf("default page = %v", defaults)
 	}
 }
 
 func TestListReviewsRequestValidation(t *testing.T) {
-	h := newHarness(t)
+	e := newE2E(t)
 	cases := []struct {
 		path string
 		want int
@@ -203,7 +121,7 @@ func TestListReviewsRequestValidation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.path, func(t *testing.T) {
-			if status, _ := h.getJSON(tc.path); status != tc.want {
+			if status, _, _ := e.request(http.MethodGet, tc.path, nil, nil); status != tc.want {
 				t.Fatalf("status = %d, want %d", status, tc.want)
 			}
 		})
@@ -211,7 +129,7 @@ func TestListReviewsRequestValidation(t *testing.T) {
 }
 
 func TestCreateReviewRequestValidation(t *testing.T) {
-	h := newHarness(t)
+	e := newE2E(t)
 	cases := []struct {
 		name string
 		path string
@@ -227,7 +145,7 @@ func TestCreateReviewRequestValidation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			status, body := h.postJSON(tc.path, tc.body)
+			status, body, _ := e.request(http.MethodPost, tc.path, []byte(tc.body), nil)
 			if status != tc.want {
 				t.Fatalf("status = %d, want %d (%v)", status, tc.want, body)
 			}
@@ -238,10 +156,13 @@ func TestCreateReviewRequestValidation(t *testing.T) {
 	}
 }
 
+// The status mapping matters more than the message: a provider outage must
+// never be reported to a legitimate user as a rejected credential.
 func TestGoogleAuthStatusMapping(t *testing.T) {
-	h := newHarness(t)
+	e := newE2E(t)
+	e.google.issue("tok", "google-1", "user@example.com", "Test User")
 
-	status, body := h.postJSON("/api/v1/auth/google", `{"id_token":"tok"}`)
+	status, body, _ := e.request(http.MethodPost, "/api/v1/auth/google", []byte(`{"id_token":"tok"}`), nil)
 	if status != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (%v)", status, body)
 	}
@@ -251,63 +172,37 @@ func TestGoogleAuthStatusMapping(t *testing.T) {
 	}
 
 	// A rejected credential is the caller's problem: 401.
-	h.auth.Verifier = auth.FakeVerifier{Err: auth.ErrInvalidToken}
-	if status, _ := h.postJSON("/api/v1/auth/google", `{"id_token":"tok"}`); status != http.StatusUnauthorized {
+	e.auth.Verifier = auth.FakeVerifier{Err: auth.ErrInvalidToken}
+	if status, _, _ := e.request(http.MethodPost, "/api/v1/auth/google", []byte(`{"id_token":"tok"}`), nil); status != http.StatusUnauthorized {
 		t.Fatalf("invalid token status = %d, want 401", status)
 	}
 
 	// A provider outage is ours: 502, not a false "your login is invalid".
-	h.auth.Verifier = auth.FakeVerifier{Err: auth.ErrProviderUnavailable}
-	if status, _ := h.postJSON("/api/v1/auth/google", `{"id_token":"tok"}`); status != http.StatusBadGateway {
+	e.auth.Verifier = auth.FakeVerifier{Err: auth.ErrProviderUnavailable}
+	if status, _, _ := e.request(http.MethodPost, "/api/v1/auth/google", []byte(`{"id_token":"tok"}`), nil); status != http.StatusBadGateway {
 		t.Fatalf("provider outage status = %d, want 502", status)
 	}
 }
 
 func TestSubscriptionInitializeValidation(t *testing.T) {
-	h := newHarness(t)
-	h.subs.Provider = payments.FakeProvider{InitErr: payments.ErrProvider}
+	e := newE2E(t)
 
 	// Bad input is rejected before the provider is called.
-	if status, _ := h.postJSON("/api/v1/subscriptions/initialize", `{"email":"user@example.com","amount":5000}`); status != http.StatusBadRequest {
+	if status, _, _ := e.request(http.MethodPost, "/api/v1/subscriptions/initialize",
+		[]byte(`{"email":"user@example.com","amount":5000}`), nil); status != http.StatusBadRequest {
 		t.Fatalf("missing user_id status = %d, want 400", status)
 	}
+
 	// A provider failure is an upstream problem, not a client error.
-	if status, _ := h.postJSON("/api/v1/subscriptions/initialize", `{"user_id":"user_1","email":"user@example.com","amount":5000}`); status != http.StatusBadGateway {
+	e.subs.Provider = payments.FakeProvider{InitErr: payments.ErrProvider}
+	if status, _, _ := e.request(http.MethodPost, "/api/v1/subscriptions/initialize",
+		[]byte(`{"user_id":"user_1","email":"user@example.com","amount":5000}`), nil); status != http.StatusBadGateway {
 		t.Fatalf("provider failure status = %d, want 502", status)
 	}
 
-	h.subs.Provider = payments.FakeProvider{InitResp: payments.InitializeResponse{
-		AuthorizationURL: "https://checkout.paystack.com/abc", AccessCode: "abc", Reference: "ref_1",
-	}}
-	status, body := h.postJSON("/api/v1/subscriptions/initialize", `{"user_id":"user_1","email":"user@example.com","plan_code":"PLN_x","amount":5000}`)
-	if status != http.StatusOK || body["reference"] != "ref_1" {
-		t.Fatalf("status = %d body = %v", status, body)
-	}
-
-	status, sub := h.getJSON("/api/v1/subscriptions/user_1")
-	if status != http.StatusOK || sub["status"] != "pending" {
-		t.Fatalf("status = %d sub = %v", status, sub)
-	}
-	if status, _ := h.getJSON("/api/v1/subscriptions/nobody"); status != http.StatusNotFound {
+	if status, _, _ := e.request(http.MethodGet, "/api/v1/subscriptions/nobody", nil, nil); status != http.StatusNotFound {
 		t.Fatalf("unknown subscription status = %d, want 404", status)
 	}
-}
-
-func sign(body []byte) string {
-	mac := hmac.New(sha512.New, []byte(webhookSecret))
-	mac.Write(body)
-	return hex.EncodeToString(mac.Sum(nil))
-}
-
-func (h *harness) seedPendingSubscription(t *testing.T, userID, reference string) {
-	t.Helper()
-	h.subs.Provider = payments.FakeProvider{InitResp: payments.InitializeResponse{
-		AuthorizationURL: "https://checkout.paystack.com/abc", AccessCode: "abc", Reference: reference,
-	}}
-	if _, err := h.subs.Initialize(context.Background(), userID, "user@example.com", "PLN_x", 5000); err != nil {
-		t.Fatal(err)
-	}
-	h.subs.Provider = &payments.PaystackClient{SecretKey: webhookSecret}
 }
 
 func chargeSuccessPayload(reference, padding string) []byte {
@@ -320,68 +215,49 @@ func chargeSuccessPayloadFor(reference, userID, padding string) []byte {
 		`"metadata":{"user_id":"` + userID + `"},"log":"` + padding + `"}}`)
 }
 
-func TestWebhookAppliesSignedEvent(t *testing.T) {
-	h := newHarness(t)
-	h.seedPendingSubscription(t, "user_1", "ref_1")
-
-	body := chargeSuccessPayload("ref_1", "")
-	status, raw := h.do(http.MethodPost, "/api/v1/subscriptions/webhook", bytes.NewReader(body),
-		map[string]string{"x-paystack-signature": sign(body)})
-	if status != http.StatusOK {
-		t.Fatalf("status = %d, want 200: %s", status, raw)
-	}
-
-	sub, err := h.store.GetSubscription("user_1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if sub.Status != "active" {
-		t.Fatalf("subscription = %+v, want active", sub)
-	}
-}
-
 // The signature covers the exact bytes received, so the handler has to read the
 // body in full. Reading only what Content-Length advertised — or a single
 // Read call — truncated large and chunked payloads, which then failed
 // verification even though the delivery was genuine.
 func TestWebhookReadsWholeBodyRegardlessOfFraming(t *testing.T) {
 	t.Run("body spanning multiple reads", func(t *testing.T) {
-		h := newHarness(t)
-		h.seedPendingSubscription(t, "user_1", "ref_1")
+		e := newE2E(t)
+		reference := e.seedPendingSubscription(t, "user_1")
 
-		body := chargeSuccessPayload("ref_1", strings.Repeat("x", 64*1024))
-		status, raw := h.do(http.MethodPost, "/api/v1/subscriptions/webhook", bytes.NewReader(body),
-			map[string]string{"x-paystack-signature": sign(body)})
+		body := chargeSuccessPayload(reference, strings.Repeat("x", 64*1024))
+		status, _, _ := e.request(http.MethodPost, "/api/v1/subscriptions/webhook", body,
+			map[string]string{"x-paystack-signature": e2eSign(body)})
 		if status != http.StatusOK {
-			t.Fatalf("status = %d, want 200: %s", status, raw)
+			t.Fatalf("status = %d, want 200", status)
 		}
-		if sub, _ := h.store.GetSubscription("user_1"); sub.Status != "active" {
+		if sub, _ := e.store.GetSubscription("user_1"); sub.Status != "active" {
 			t.Fatalf("subscription = %+v, want active", sub)
 		}
 	})
 
 	t.Run("chunked body with no content-length", func(t *testing.T) {
-		h := newHarness(t)
-		h.seedPendingSubscription(t, "user_1", "ref_1")
+		e := newE2E(t)
+		reference := e.seedPendingSubscription(t, "user_1")
 
-		body := chargeSuccessPayload("ref_1", "")
+		body := chargeSuccessPayload(reference, "")
 		// io.NopCloser hides the concrete reader type, so net/http cannot
 		// derive a Content-Length and sends the request chunked.
-		status, raw := h.do(http.MethodPost, "/api/v1/subscriptions/webhook", io.NopCloser(bytes.NewReader(body)),
-			map[string]string{"x-paystack-signature": sign(body)})
+		status, _, _ := e.requestReader(http.MethodPost, "/api/v1/subscriptions/webhook",
+			io.NopCloser(bytes.NewReader(body)),
+			map[string]string{"Content-Type": "application/json", "x-paystack-signature": e2eSign(body)})
 		if status != http.StatusOK {
-			t.Fatalf("status = %d, want 200: %s", status, raw)
+			t.Fatalf("status = %d, want 200", status)
 		}
-		if sub, _ := h.store.GetSubscription("user_1"); sub.Status != "active" {
+		if sub, _ := e.store.GetSubscription("user_1"); sub.Status != "active" {
 			t.Fatalf("subscription = %+v, want active", sub)
 		}
 	})
 }
 
 func TestWebhookRejectsUnsignedAndUnknownDeliveries(t *testing.T) {
-	h := newHarness(t)
-	h.seedPendingSubscription(t, "user_1", "ref_1")
-	body := chargeSuccessPayload("ref_1", "")
+	e := newE2E(t)
+	reference := e.seedPendingSubscription(t, "user_1")
+	body := chargeSuccessPayload(reference, "")
 
 	cases := []struct {
 		name      string
@@ -390,89 +266,64 @@ func TestWebhookRejectsUnsignedAndUnknownDeliveries(t *testing.T) {
 		want      int
 	}{
 		{"missing signature", body, "", http.StatusUnauthorized},
-		{"wrong signature", body, sign([]byte("something else")), http.StatusUnauthorized},
-		{"signature over a different body", chargeSuccessPayload("ref_1", "tampered"), sign(body), http.StatusUnauthorized},
+		{"wrong signature", body, e2eSign([]byte("something else")), http.StatusUnauthorized},
+		{"signature over a different body", chargeSuccessPayload(reference, "tampered"), e2eSign(body), http.StatusUnauthorized},
 		{
 			"unknown subscription",
 			chargeSuccessPayloadFor("ref_unknown", "user_nobody", ""),
-			sign(chargeSuccessPayloadFor("ref_unknown", "user_nobody", "")),
+			e2eSign(chargeSuccessPayloadFor("ref_unknown", "user_nobody", "")),
 			http.StatusNotFound,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			status, _ := h.do(http.MethodPost, "/api/v1/subscriptions/webhook", bytes.NewReader(tc.body),
+			status, _, _ := e.request(http.MethodPost, "/api/v1/subscriptions/webhook", tc.body,
 				map[string]string{"x-paystack-signature": tc.signature})
 			if status != tc.want {
 				t.Fatalf("status = %d, want %d", status, tc.want)
 			}
-			if sub, _ := h.store.GetSubscription("user_1"); sub.Status != "pending" {
+			if sub, _ := e.store.GetSubscription("user_1"); sub.Status != "pending" {
 				t.Fatalf("rejected delivery changed state: %+v", sub)
 			}
 		})
 	}
 }
 
-// A duplicate delivery is acknowledged but must not be applied twice.
-func TestWebhookDuplicateDeliveryIsAcknowledgedOnce(t *testing.T) {
-	h := newHarness(t)
-	h.seedPendingSubscription(t, "user_1", "ref_1")
-	body := chargeSuccessPayload("ref_1", "")
-	signature := sign(body)
-
-	for i := 0; i < 2; i++ {
-		status, raw := h.do(http.MethodPost, "/api/v1/subscriptions/webhook", bytes.NewReader(body),
-			map[string]string{"x-paystack-signature": signature})
-		if status != http.StatusOK {
-			t.Fatalf("delivery %d: status = %d, want 200: %s", i+1, status, raw)
-		}
-	}
-
-	// Move the subscription on, then replay: the replay must be ignored.
-	sub, _ := h.store.GetSubscription("user_1")
-	sub.Status = "cancelled"
-	h.store.PutSubscription(sub)
-
-	if status, _ := h.do(http.MethodPost, "/api/v1/subscriptions/webhook", bytes.NewReader(body),
-		map[string]string{"x-paystack-signature": signature}); status != http.StatusOK {
-		t.Fatalf("replay status = %d, want 200", status)
-	}
-	if sub, _ := h.store.GetSubscription("user_1"); sub.Status != "cancelled" {
-		t.Fatalf("replay re-applied the event: %+v", sub)
-	}
-}
-
 // An event we do not act on is acknowledged so the provider stops retrying it.
 func TestWebhookAcknowledgesUnsupportedEvent(t *testing.T) {
-	h := newHarness(t)
-	h.seedPendingSubscription(t, "user_1", "ref_1")
+	e := newE2E(t)
+	e.seedPendingSubscription(t, "user_1")
 
 	body := []byte(`{"event":"customeridentification.failed","data":{"id":7}}`)
-	status, _ := h.do(http.MethodPost, "/api/v1/subscriptions/webhook", bytes.NewReader(body),
-		map[string]string{"x-paystack-signature": sign(body)})
+	status, _, _ := e.request(http.MethodPost, "/api/v1/subscriptions/webhook", body,
+		map[string]string{"x-paystack-signature": e2eSign(body)})
 	if status != http.StatusOK {
 		t.Fatalf("status = %d, want 200", status)
 	}
-	if sub, _ := h.store.GetSubscription("user_1"); sub.Status != "pending" {
+	if sub, _ := e.store.GetSubscription("user_1"); sub.Status != "pending" {
 		t.Fatalf("unsupported event changed state: %+v", sub)
 	}
 }
 
 // Framework-generated errors must use the same JSON envelope as handlers.
 func TestUnroutedRequestsReturnJSONErrors(t *testing.T) {
-	h := newHarness(t)
+	e := newE2E(t)
 
-	status, body := h.getJSON("/api/v1/nope")
+	status, body, _ := e.request(http.MethodGet, "/api/v1/nope", nil, nil)
 	if status != http.StatusNotFound || body["error"] == nil {
 		t.Fatalf("status = %d body = %v", status, body)
 	}
 
-	status, raw := h.do(http.MethodDelete, "/api/v1/businesses/biz_1", nil, nil)
+	status, decoded, _ := e.request(http.MethodDelete, "/api/v1/businesses/biz_1", nil, nil)
 	if status != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405", status)
 	}
-	var out map[string]any
-	if err := json.Unmarshal(raw, &out); err != nil || out["error"] == nil {
-		t.Fatalf("405 body was not a JSON error: %s", raw)
+	if decoded["error"] == nil {
+		t.Fatalf("405 body was not a JSON error: %v", decoded)
+	}
+	// Guard the envelope shape itself: one key, always a string.
+	raw, _ := json.Marshal(decoded)
+	if !strings.HasPrefix(string(raw), `{"error":"`) {
+		t.Fatalf("unexpected error envelope: %s", raw)
 	}
 }
