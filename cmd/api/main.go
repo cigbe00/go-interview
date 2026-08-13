@@ -20,6 +20,15 @@ import (
 	"github.com/maoni/backend-takehome/internal/store"
 )
 
+// The mock store is the only implementation of the repository interfaces the
+// services depend on. Asserting it here keeps the wiring honest and makes a
+// future MongoDB implementation a drop-in replacement.
+var (
+	_ service.BusinessRepository     = (*store.MemoryStore)(nil)
+	_ service.SubscriptionRepository = (*store.MemoryStore)(nil)
+	_ service.UserRepository         = (*store.MemoryStore)(nil)
+)
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)

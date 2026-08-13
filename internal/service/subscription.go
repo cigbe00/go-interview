@@ -10,7 +10,6 @@ import (
 
 	"github.com/maoni/backend-takehome/internal/model"
 	"github.com/maoni/backend-takehome/internal/payments"
-	"github.com/maoni/backend-takehome/internal/store"
 )
 
 var (
@@ -26,8 +25,19 @@ const (
 	statusActive  = "active"
 )
 
+// SubscriptionRepository is the persistence surface SubscriptionService
+// depends on. MarkEventProcessed must be an atomic claim — it reports whether
+// this caller was the one that took the event — because it is what makes
+// webhook processing idempotent under concurrent redelivery.
+type SubscriptionRepository interface {
+	GetSubscription(userID string) (model.Subscription, error)
+	GetSubscriptionByReference(reference string) (model.Subscription, error)
+	PutSubscription(sub model.Subscription)
+	MarkEventProcessed(id string) bool
+}
+
 type SubscriptionService struct {
-	Store    *store.MemoryStore
+	Store    SubscriptionRepository
 	Provider payments.Provider
 	Logger   *slog.Logger
 }

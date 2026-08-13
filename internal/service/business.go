@@ -10,7 +10,14 @@ import (
 
 	"github.com/maoni/backend-takehome/internal/cache"
 	"github.com/maoni/backend-takehome/internal/model"
-	"github.com/maoni/backend-takehome/internal/store"
+)
+
+// Paging bounds live here rather than in the API layer so every caller of the
+// service is held to the same limits, and the HTTP layer validates against the
+// same numbers it enforces.
+const (
+	DefaultPageLimit = 10
+	MaxPageLimit     = 100
 )
 
 const (
@@ -18,6 +25,11 @@ const (
 	// cacheOpTimeout bounds a single cache round trip so a slow or wedged
 	// Redis cannot hold a request open for the whole server write timeout.
 	cacheOpTimeout = 250 * time.Millisecond
+	// defaultCacheTTL is used when no TTL is configured. It must never be
+	// zero: go-redis treats a zero expiration as "no expiry", which would turn
+	// the cache into permanent storage and remove the backstop that bounds how
+	// long a failed invalidation can serve stale data.
+	defaultCacheTTL = 5 * time.Minute
 )
 
 var (
@@ -26,8 +38,19 @@ var (
 	ErrBodyTooLong   = fmt.Errorf("review body must be at most %d characters", maxReviewBodyLen)
 )
 
+// BusinessRepository is the persistence surface BusinessService depends on.
+// It is declared here, at the point of use, so the service can be tested
+// against a stub and so swapping the mock store for MongoDB is a matter of
+// providing another implementation.
+type BusinessRepository interface {
+	GetBusiness(id string) (model.Business, error)
+	SaveReview(r model.Review) error
+	ListReviews(businessID string, page, limit int) ([]model.Review, int)
+	ReviewStats(businessID string) (count int, average float64)
+}
+
 type BusinessService struct {
-	Store    *store.MemoryStore
+	Store    BusinessRepository
 	Cache    cache.BusinessCache
 	CacheTTL time.Duration
 	Logger   *slog.Logger
@@ -38,6 +61,13 @@ func (s *BusinessService) logger() *slog.Logger {
 		return s.Logger
 	}
 	return slog.Default()
+}
+
+func (s *BusinessService) cacheTTL() time.Duration {
+	if s.CacheTTL <= 0 {
+		return defaultCacheTTL
+	}
+	return s.CacheTTL
 }
 
 func (s *BusinessService) GetBusiness(ctx context.Context, id string) (model.Business, error) {
@@ -62,7 +92,7 @@ func (s *BusinessService) GetBusiness(ctx context.Context, id string) (model.Bus
 
 	if s.Cache != nil {
 		cctx, cancel := context.WithTimeout(ctx, cacheOpTimeout)
-		if err := s.Cache.SetBusiness(cctx, b, s.CacheTTL); err != nil {
+		if err := s.Cache.SetBusiness(cctx, b, s.cacheTTL()); err != nil {
 			s.logger().WarnContext(ctx, "business cache write failed", "business_id", b.ID, "error", err)
 		}
 		cancel()
@@ -82,7 +112,7 @@ func (s *BusinessService) CreateReview(ctx context.Context, businessID, userID s
 	if len(body) > maxReviewBodyLen {
 		return model.Review{}, ErrBodyTooLong
 	}
-	if _, err := s.Store.GetBusinessRaw(businessID); err != nil {
+	if _, err := s.Store.GetBusiness(businessID); err != nil {
 		return model.Review{}, err
 	}
 
@@ -95,6 +125,9 @@ func (s *BusinessService) CreateReview(ctx context.Context, businessID, userID s
 		CreatedAt:  time.Now().UTC(),
 	}
 	if err := s.Store.SaveReview(r); err != nil {
+		// Nothing was written, so the cached copy is still correct and must
+		// not be invalidated: doing so would turn a failed write into
+		// avoidable load on the store.
 		return model.Review{}, err
 	}
 
@@ -129,10 +162,13 @@ func (s *BusinessService) ListReviews(ctx context.Context, businessID string, pa
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 100 {
-		limit = 10
+	if limit < 1 {
+		limit = DefaultPageLimit
 	}
-	if _, err := s.Store.GetBusinessRaw(businessID); err != nil {
+	if limit > MaxPageLimit {
+		limit = MaxPageLimit
+	}
+	if _, err := s.Store.GetBusiness(businessID); err != nil {
 		return nil, 0, err
 	}
 	reviews, total := s.Store.ListReviews(businessID, page, limit)

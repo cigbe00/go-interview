@@ -18,8 +18,21 @@ import (
 const (
 	maxRequestBody = 1 << 20 // 1 MiB
 	defaultPage    = 1
-	defaultLimit   = 10
-	maxLimit       = 100
+)
+
+// Client-facing messages. Internal detail (provider responses, decode errors,
+// which validation rule a token failed) is logged, never returned: it is of no
+// use to a caller and tells an attacker how the checks work.
+const (
+	msgInternal            = "internal error"
+	msgBusinessNotFound    = "business not found"
+	msgInvalidRequest      = "invalid request"
+	msgInvalidCredentials  = "invalid identity token"
+	msgProviderUnavailable = "identity provider unavailable"
+	msgPaymentProvider     = "payment provider error"
+	msgInvalidSignature    = "invalid signature"
+	msgWebhookRejected     = "webhook could not be processed"
+	msgSubscriptionMissing = "subscription not found"
 )
 
 type Server struct {
@@ -54,7 +67,7 @@ func (s *Server) errorHandler(err error, c echo.Context) {
 		return
 	}
 	status := http.StatusInternalServerError
-	message := "internal error"
+	message := msgInternal
 	var he *echo.HTTPError
 	if errors.As(err, &he) {
 		status = he.Code
@@ -105,11 +118,11 @@ func (s *Server) health(c echo.Context) error {
 func (s *Server) getBusiness(c echo.Context) error {
 	b, err := s.Businesses.GetBusiness(c.Request().Context(), c.Param("id"))
 	if errors.Is(err, store.ErrNotFound) {
-		return c.JSON(http.StatusNotFound, errorBody("business not found"))
+		return c.JSON(http.StatusNotFound, errorBody(msgBusinessNotFound))
 	}
 	if err != nil {
 		s.logger().ErrorContext(c.Request().Context(), "get business failed", "business_id", c.Param("id"), "error", err)
-		return c.JSON(http.StatusInternalServerError, errorBody("internal error"))
+		return c.JSON(http.StatusInternalServerError, errorBody(msgInternal))
 	}
 	return c.JSON(http.StatusOK, b)
 }
@@ -119,18 +132,18 @@ func (s *Server) listReviews(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, errorBody("page must be a positive integer"))
 	}
-	limit, err := positiveIntParam(c.QueryParam("limit"), defaultLimit)
-	if err != nil || limit > maxLimit {
-		return c.JSON(http.StatusBadRequest, errorBody("limit must be an integer between 1 and "+strconv.Itoa(maxLimit)))
+	limit, err := positiveIntParam(c.QueryParam("limit"), service.DefaultPageLimit)
+	if err != nil || limit > service.MaxPageLimit {
+		return c.JSON(http.StatusBadRequest, errorBody("limit must be an integer between 1 and "+strconv.Itoa(service.MaxPageLimit)))
 	}
 
 	reviews, total, err := s.Businesses.ListReviews(c.Request().Context(), c.Param("id"), page, limit)
 	if errors.Is(err, store.ErrNotFound) {
-		return c.JSON(http.StatusNotFound, errorBody("business not found"))
+		return c.JSON(http.StatusNotFound, errorBody(msgBusinessNotFound))
 	}
 	if err != nil {
 		s.logger().ErrorContext(c.Request().Context(), "list reviews failed", "business_id", c.Param("id"), "error", err)
-		return c.JSON(http.StatusInternalServerError, errorBody("internal error"))
+		return c.JSON(http.StatusInternalServerError, errorBody(msgInternal))
 	}
 	return c.JSON(http.StatusOK, map[string]any{
 		"data":  reviews,
@@ -164,7 +177,7 @@ func (s *Server) createReview(c echo.Context) error {
 		Body   string `json:"body"`
 	}
 	if err := c.Bind(&req); err != nil {
-		return c.JSON(http.StatusBadRequest, errorBody("invalid request"))
+		return c.JSON(http.StatusBadRequest, errorBody(msgInvalidRequest))
 	}
 	r, err := s.Businesses.CreateReview(c.Request().Context(), c.Param("id"), req.UserID, req.Rating, req.Body)
 	switch {
@@ -173,10 +186,10 @@ func (s *Server) createReview(c echo.Context) error {
 		errors.Is(err, service.ErrBodyTooLong):
 		return c.JSON(http.StatusBadRequest, errorBody(err.Error()))
 	case errors.Is(err, store.ErrNotFound):
-		return c.JSON(http.StatusNotFound, errorBody("business not found"))
+		return c.JSON(http.StatusNotFound, errorBody(msgBusinessNotFound))
 	case err != nil:
 		s.logger().ErrorContext(c.Request().Context(), "create review failed", "business_id", c.Param("id"), "error", err)
-		return c.JSON(http.StatusInternalServerError, errorBody("internal error"))
+		return c.JSON(http.StatusInternalServerError, errorBody(msgInternal))
 	}
 	return c.JSON(http.StatusCreated, r)
 }
@@ -186,7 +199,7 @@ func (s *Server) googleAuth(c echo.Context) error {
 		IDToken string `json:"id_token"`
 	}
 	if err := c.Bind(&req); err != nil {
-		return c.JSON(http.StatusBadRequest, errorBody("invalid request"))
+		return c.JSON(http.StatusBadRequest, errorBody(msgInvalidRequest))
 	}
 	u, err := s.Auth.SignInGoogle(c.Request().Context(), req.IDToken)
 	if err != nil {
@@ -194,9 +207,12 @@ func (s *Server) googleAuth(c echo.Context) error {
 		// reported as a rejected credential.
 		if errors.Is(err, auth.ErrProviderUnavailable) {
 			s.logger().ErrorContext(c.Request().Context(), "google sign-in provider failure", "error", err)
-			return c.JSON(http.StatusBadGateway, errorBody("identity provider unavailable"))
+			return c.JSON(http.StatusBadGateway, errorBody(msgProviderUnavailable))
 		}
-		return c.JSON(http.StatusUnauthorized, errorBody(err.Error()))
+		// Which check the token failed (audience, issuer, expiry, verified
+		// email) is logged for us, not returned to the caller.
+		s.logger().InfoContext(c.Request().Context(), "google sign-in rejected", "error", err)
+		return c.JSON(http.StatusUnauthorized, errorBody(msgInvalidCredentials))
 	}
 	return c.JSON(http.StatusOK, map[string]any{"user": u})
 }
@@ -209,7 +225,7 @@ func (s *Server) initializeSubscription(c echo.Context) error {
 		Amount   int64  `json:"amount"`
 	}
 	if err := c.Bind(&req); err != nil {
-		return c.JSON(http.StatusBadRequest, errorBody("invalid request"))
+		return c.JSON(http.StatusBadRequest, errorBody(msgInvalidRequest))
 	}
 	resp, err := s.Subscriptions.Initialize(c.Request().Context(), req.UserID, req.Email, req.PlanCode, req.Amount)
 	if errors.Is(err, service.ErrInvalidSubscriptionRequest) {
@@ -217,7 +233,7 @@ func (s *Server) initializeSubscription(c echo.Context) error {
 	}
 	if err != nil {
 		s.logger().ErrorContext(c.Request().Context(), "subscription initialize failed", "user_id", req.UserID, "error", err)
-		return c.JSON(http.StatusBadGateway, errorBody("payment provider error"))
+		return c.JSON(http.StatusBadGateway, errorBody(msgPaymentProvider))
 	}
 	return c.JSON(http.StatusOK, resp)
 }
@@ -237,17 +253,21 @@ func (s *Server) webhook(c echo.Context) error {
 	switch {
 	case errors.Is(err, payments.ErrInvalidSignature):
 		s.logger().WarnContext(c.Request().Context(), "rejected webhook with invalid signature", "bytes", len(body))
-		return c.JSON(http.StatusUnauthorized, errorBody("invalid signature"))
+		return c.JSON(http.StatusUnauthorized, errorBody(msgInvalidSignature))
 	case errors.Is(err, service.ErrUnknownSubscription):
-		// Nothing to apply and a retry will not change that.
-		s.logger().WarnContext(c.Request().Context(), "webhook for unknown subscription", "error", err)
-		return c.JSON(http.StatusNotFound, errorBody("subscription not found"))
+		// Deliberately not acknowledged. Money may have moved without a
+		// subscription to apply it to, so Paystack should retry: the event was
+		// not consumed, and a redelivery succeeds once the subscription
+		// exists. This needs to alert — see PULL_REQUEST.md.
+		s.logger().ErrorContext(c.Request().Context(), "webhook could not be matched to a subscription", "error", err)
+		return c.JSON(http.StatusNotFound, errorBody(msgSubscriptionMissing))
 	case errors.Is(err, payments.ErrUnsupportedEvent):
 		// Acknowledged so the provider stops retrying an event we ignore.
 		return c.NoContent(http.StatusOK)
 	case err != nil:
+		// Parse and provider detail is logged, not echoed back to the sender.
 		s.logger().ErrorContext(c.Request().Context(), "webhook processing failed", "error", err)
-		return c.JSON(http.StatusBadRequest, errorBody(err.Error()))
+		return c.JSON(http.StatusBadRequest, errorBody(msgWebhookRejected))
 	}
 	return c.NoContent(http.StatusOK)
 }
@@ -255,11 +275,11 @@ func (s *Server) webhook(c echo.Context) error {
 func (s *Server) getSubscription(c echo.Context) error {
 	sub, err := s.Subscriptions.Get(c.Param("userID"))
 	if errors.Is(err, store.ErrNotFound) {
-		return c.JSON(http.StatusNotFound, errorBody("subscription not found"))
+		return c.JSON(http.StatusNotFound, errorBody(msgSubscriptionMissing))
 	}
 	if err != nil {
 		s.logger().ErrorContext(c.Request().Context(), "get subscription failed", "user_id", c.Param("userID"), "error", err)
-		return c.JSON(http.StatusInternalServerError, errorBody("internal error"))
+		return c.JSON(http.StatusInternalServerError, errorBody(msgInternal))
 	}
 	return c.JSON(http.StatusOK, sub)
 }

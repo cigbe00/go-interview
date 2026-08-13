@@ -62,10 +62,6 @@ func NewMemoryStore() *MemoryStore {
 // This previously matched on Slug, which made every lookup by the documented
 // ID (biz_1) return ErrNotFound.
 func (s *MemoryStore) GetBusiness(id string) (model.Business, error) {
-	return s.GetBusinessRaw(id)
-}
-
-func (s *MemoryStore) GetBusinessRaw(id string) (model.Business, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	b, ok := s.businesses[id]
@@ -73,6 +69,14 @@ func (s *MemoryStore) GetBusinessRaw(id string) (model.Business, error) {
 		return model.Business{}, ErrNotFound
 	}
 	return b, nil
+}
+
+// GetBusinessRaw is retained as an alias for GetBusiness because the provided
+// starter test depends on it. Now that GetBusiness resolves by identifier the
+// two are the same lookup, and this should be collapsed into one method once
+// that test can be updated.
+func (s *MemoryStore) GetBusinessRaw(id string) (model.Business, error) {
+	return s.GetBusiness(id)
 }
 
 // SaveReview appends to ReviewsCollection. It previously wrote to the
