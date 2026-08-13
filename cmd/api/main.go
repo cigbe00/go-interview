@@ -2,8 +2,12 @@ package main
 
 import (
 	"context"
-	"log"
+	"errors"
+	"log/slog"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/maoni/backend-takehome/internal/api"
@@ -17,6 +21,9 @@ import (
 )
 
 func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(logger)
+
 	cfg := config.Load()
 	st := store.NewMemoryStore()
 
@@ -27,13 +34,13 @@ func main() {
 	err := rc.Ping(pingCtx)
 	cancel()
 	if err != nil {
-		log.Printf("redis unavailable at %s; continuing without cache: %v", cfg.RedisAddr, err)
+		logger.Warn("redis unavailable; continuing without cache", "addr", cfg.RedisAddr, "error", err)
 		_ = rc.Close()
 	} else {
 		redisConnected = true
 		businessCache = rc
 		defer rc.Close()
-		log.Printf("connected to local redis at %s", cfg.RedisAddr)
+		logger.Info("connected to local redis", "addr", cfg.RedisAddr)
 	}
 
 	redisHealthy := func() bool {
@@ -45,20 +52,54 @@ func main() {
 		return rc.Ping(ctx) == nil
 	}
 
-	httpClient := &http.Client{Timeout: cfg.PaystackTimeout}
-	google := &auth.GoogleVerifier{ClientID: cfg.GoogleClientID, TokenInfoURL: cfg.GoogleTokenInfoURL, HTTPClient: httpClient}
-	paystack := &payments.PaystackClient{SecretKey: cfg.PaystackSecretKey, BaseURL: cfg.PaystackBaseURL, HTTPClient: httpClient}
+	// Separate clients so one provider's timeout budget cannot be tightened or
+	// loosened by the other's configuration.
+	google := &auth.GoogleVerifier{
+		ClientID:     cfg.GoogleClientID,
+		TokenInfoURL: cfg.GoogleTokenInfoURL,
+		HTTPClient:   &http.Client{Timeout: cfg.GoogleTimeout},
+	}
+	paystack := &payments.PaystackClient{
+		SecretKey:  cfg.PaystackSecretKey,
+		BaseURL:    cfg.PaystackBaseURL,
+		HTTPClient: &http.Client{Timeout: cfg.PaystackTimeout},
+	}
+	if cfg.GoogleClientID == "" {
+		logger.Warn("GOOGLE_CLIENT_ID is not set; google sign-in will return 502 until it is configured")
+	}
+	if cfg.PaystackSecretKey == "" {
+		logger.Warn("PAYSTACK_SECRET_KEY is not set; subscription initialize and webhooks will be rejected")
+	}
 
 	srv := api.New(
-		&service.BusinessService{Store: st, Cache: businessCache, CacheTTL: cfg.RedisBusinessTTL},
+		&service.BusinessService{Store: st, Cache: businessCache, CacheTTL: cfg.RedisBusinessTTL, Logger: logger},
 		&service.AuthService{Store: st, Verifier: google},
-		&service.SubscriptionService{Store: st, Provider: paystack},
+		&service.SubscriptionService{Store: st, Provider: paystack, Logger: logger},
 		redisHealthy,
 	)
+	srv.Logger = logger
 	srv.Echo.Server.ReadHeaderTimeout = 5 * time.Second
 	srv.Echo.Server.ReadTimeout = 10 * time.Second
 	srv.Echo.Server.WriteTimeout = 10 * time.Second
 
-	log.Printf("Maoni take-home API listening on :%s", cfg.Port)
-	srv.Echo.Logger.Fatal(srv.Echo.Start(":" + cfg.Port))
+	// Drain in-flight requests on SIGINT/SIGTERM instead of cutting them off:
+	// a webhook that is mid-apply should be allowed to finish.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		logger.Info("maoni take-home api listening", "port", cfg.Port)
+		if err := srv.Echo.Start(":" + cfg.Port); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("server stopped", "error", err)
+			stop()
+		}
+	}()
+
+	<-ctx.Done()
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelShutdown()
+	if err := srv.Echo.Shutdown(shutdownCtx); err != nil {
+		logger.Error("graceful shutdown failed", "error", err)
+	}
+	logger.Info("shutdown complete")
 }

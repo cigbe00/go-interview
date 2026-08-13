@@ -2,14 +2,24 @@ package api
 
 import (
 	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"strconv"
+
 	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
 	"github.com/maoni/backend-takehome/internal/auth"
 	"github.com/maoni/backend-takehome/internal/payments"
 	"github.com/maoni/backend-takehome/internal/service"
 	"github.com/maoni/backend-takehome/internal/store"
-	"io"
-	"net/http"
-	"strconv"
+)
+
+const (
+	maxRequestBody = 1 << 20 // 1 MiB
+	defaultPage    = 1
+	defaultLimit   = 10
+	maxLimit       = 100
 )
 
 type Server struct {
@@ -18,22 +28,60 @@ type Server struct {
 	Auth          *service.AuthService
 	Subscriptions *service.SubscriptionService
 	RedisHealthy  func() bool
+	Logger        *slog.Logger
 }
 
 func New(b *service.BusinessService, a *service.AuthService, s *service.SubscriptionService, redisHealthy func() bool) *Server {
 	e := echo.New()
-	srv := &Server{Echo: e, Businesses: b, Auth: a, Subscriptions: s, RedisHealthy: redisHealthy}
+	e.HideBanner = true
+	srv := &Server{Echo: e, Businesses: b, Auth: a, Subscriptions: s, RedisHealthy: redisHealthy, Logger: slog.Default()}
+	srv.middleware()
 	srv.routes()
 	return srv
 }
-func (s *Server) routes() {
-	s.Echo.GET("/health", func(c echo.Context) error {
-		healthy := false
-		if s.RedisHealthy != nil {
-			healthy = s.RedisHealthy()
+
+func (s *Server) middleware() {
+	s.Echo.Use(middleware.Recover())
+	s.Echo.Use(middleware.RequestID())
+	s.Echo.Use(middleware.BodyLimit(strconv.Itoa(maxRequestBody)))
+	// Keep framework-generated errors (404, 405, 415, body-limit) in the same
+	// JSON envelope the handlers use, so clients only parse one shape.
+	s.Echo.HTTPErrorHandler = s.errorHandler
+}
+
+func (s *Server) errorHandler(err error, c echo.Context) {
+	if c.Response().Committed {
+		return
+	}
+	status := http.StatusInternalServerError
+	message := "internal error"
+	var he *echo.HTTPError
+	if errors.As(err, &he) {
+		status = he.Code
+		if m, ok := he.Message.(string); ok {
+			message = m
+		} else {
+			message = http.StatusText(he.Code)
 		}
-		return c.JSON(http.StatusOK, map[string]any{"status": "ok", "redis": healthy})
-	})
+	}
+	if status >= http.StatusInternalServerError {
+		s.logger().Error("request failed",
+			"method", c.Request().Method, "path", c.Path(), "status", status, "error", err)
+	}
+	_ = c.JSON(status, errorBody(message))
+}
+
+func (s *Server) logger() *slog.Logger {
+	if s.Logger != nil {
+		return s.Logger
+	}
+	return slog.Default()
+}
+
+func errorBody(msg string) map[string]string { return map[string]string{"error": msg} }
+
+func (s *Server) routes() {
+	s.Echo.GET("/health", s.health)
 	g := s.Echo.Group("/api/v1")
 	g.GET("/businesses/:id", s.getBusiness)
 	g.GET("/businesses/:id/reviews", s.listReviews)
@@ -43,21 +91,72 @@ func (s *Server) routes() {
 	g.POST("/subscriptions/webhook", s.webhook)
 	g.GET("/subscriptions/:userID", s.getSubscription)
 }
+
+func (s *Server) health(c echo.Context) error {
+	healthy := false
+	if s.RedisHealthy != nil {
+		healthy = s.RedisHealthy()
+	}
+	// Redis is a cache, not a dependency the API cannot serve without, so its
+	// state is reported without failing the health check.
+	return c.JSON(http.StatusOK, map[string]any{"status": "ok", "redis": healthy})
+}
+
 func (s *Server) getBusiness(c echo.Context) error {
 	b, err := s.Businesses.GetBusiness(c.Request().Context(), c.Param("id"))
 	if errors.Is(err, store.ErrNotFound) {
-		return c.JSON(404, map[string]string{"error": "business not found"})
+		return c.JSON(http.StatusNotFound, errorBody("business not found"))
 	}
 	if err != nil {
-		return c.JSON(500, map[string]string{"error": "internal error"})
+		s.logger().ErrorContext(c.Request().Context(), "get business failed", "business_id", c.Param("id"), "error", err)
+		return c.JSON(http.StatusInternalServerError, errorBody("internal error"))
 	}
-	return c.JSON(200, b)
+	return c.JSON(http.StatusOK, b)
 }
+
 func (s *Server) listReviews(c echo.Context) error {
-	page, _ := strconv.Atoi(c.QueryParam("page"))
-	limit, _ := strconv.Atoi(c.QueryParam("limit"))
-	return c.JSON(200, map[string]any{"data": s.Businesses.ListReviews(c.Param("id"), page, limit)})
+	page, err := positiveIntParam(c.QueryParam("page"), defaultPage)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, errorBody("page must be a positive integer"))
+	}
+	limit, err := positiveIntParam(c.QueryParam("limit"), defaultLimit)
+	if err != nil || limit > maxLimit {
+		return c.JSON(http.StatusBadRequest, errorBody("limit must be an integer between 1 and "+strconv.Itoa(maxLimit)))
+	}
+
+	reviews, total, err := s.Businesses.ListReviews(c.Request().Context(), c.Param("id"), page, limit)
+	if errors.Is(err, store.ErrNotFound) {
+		return c.JSON(http.StatusNotFound, errorBody("business not found"))
+	}
+	if err != nil {
+		s.logger().ErrorContext(c.Request().Context(), "list reviews failed", "business_id", c.Param("id"), "error", err)
+		return c.JSON(http.StatusInternalServerError, errorBody("internal error"))
+	}
+	return c.JSON(http.StatusOK, map[string]any{
+		"data":  reviews,
+		"page":  page,
+		"limit": limit,
+		"total": total,
+	})
 }
+
+// positiveIntParam parses an optional positive-integer query parameter.
+// An absent parameter falls back to def; a present but unparseable or
+// non-positive value is an error rather than being silently coerced.
+func positiveIntParam(raw string, def int) (int, error) {
+	if raw == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, err
+	}
+	if n < 1 {
+		return 0, errors.New("must be positive")
+	}
+	return n, nil
+}
+
 func (s *Server) createReview(c echo.Context) error {
 	var req struct {
 		UserID string `json:"user_id"`
@@ -65,37 +164,43 @@ func (s *Server) createReview(c echo.Context) error {
 		Body   string `json:"body"`
 	}
 	if err := c.Bind(&req); err != nil {
-		return c.JSON(400, map[string]string{"error": "invalid request"})
+		return c.JSON(http.StatusBadRequest, errorBody("invalid request"))
 	}
 	r, err := s.Businesses.CreateReview(c.Request().Context(), c.Param("id"), req.UserID, req.Rating, req.Body)
-	if errors.Is(err, service.ErrInvalidRating) {
-		return c.JSON(400, map[string]string{"error": err.Error()})
+	switch {
+	case errors.Is(err, service.ErrInvalidRating),
+		errors.Is(err, service.ErrUserRequired),
+		errors.Is(err, service.ErrBodyTooLong):
+		return c.JSON(http.StatusBadRequest, errorBody(err.Error()))
+	case errors.Is(err, store.ErrNotFound):
+		return c.JSON(http.StatusNotFound, errorBody("business not found"))
+	case err != nil:
+		s.logger().ErrorContext(c.Request().Context(), "create review failed", "business_id", c.Param("id"), "error", err)
+		return c.JSON(http.StatusInternalServerError, errorBody("internal error"))
 	}
-	if errors.Is(err, store.ErrNotFound) {
-		return c.JSON(404, map[string]string{"error": "business not found"})
-	}
-	if err != nil {
-		return c.JSON(500, map[string]string{"error": "internal error"})
-	}
-	return c.JSON(201, r)
+	return c.JSON(http.StatusCreated, r)
 }
+
 func (s *Server) googleAuth(c echo.Context) error {
 	var req struct {
 		IDToken string `json:"id_token"`
 	}
 	if err := c.Bind(&req); err != nil {
-		return c.JSON(400, map[string]string{"error": "invalid request"})
+		return c.JSON(http.StatusBadRequest, errorBody("invalid request"))
 	}
 	u, err := s.Auth.SignInGoogle(c.Request().Context(), req.IDToken)
 	if err != nil {
-		status := http.StatusUnauthorized
+		// A provider outage is our problem, not the caller's: it must not be
+		// reported as a rejected credential.
 		if errors.Is(err, auth.ErrProviderUnavailable) {
-			status = http.StatusBadGateway
+			s.logger().ErrorContext(c.Request().Context(), "google sign-in provider failure", "error", err)
+			return c.JSON(http.StatusBadGateway, errorBody("identity provider unavailable"))
 		}
-		return c.JSON(status, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusUnauthorized, errorBody(err.Error()))
 	}
-	return c.JSON(200, map[string]any{"user": u})
+	return c.JSON(http.StatusOK, map[string]any{"user": u})
 }
+
 func (s *Server) initializeSubscription(c echo.Context) error {
 	var req struct {
 		UserID   string `json:"user_id"`
@@ -104,42 +209,57 @@ func (s *Server) initializeSubscription(c echo.Context) error {
 		Amount   int64  `json:"amount"`
 	}
 	if err := c.Bind(&req); err != nil {
-		return c.JSON(400, map[string]string{"error": "invalid request"})
+		return c.JSON(http.StatusBadRequest, errorBody("invalid request"))
 	}
 	resp, err := s.Subscriptions.Initialize(c.Request().Context(), req.UserID, req.Email, req.PlanCode, req.Amount)
 	if errors.Is(err, service.ErrInvalidSubscriptionRequest) {
-		return c.JSON(400, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusBadRequest, errorBody(err.Error()))
 	}
 	if err != nil {
-		return c.JSON(502, map[string]string{"error": err.Error()})
+		s.logger().ErrorContext(c.Request().Context(), "subscription initialize failed", "user_id", req.UserID, "error", err)
+		return c.JSON(http.StatusBadGateway, errorBody("payment provider error"))
 	}
-	return c.JSON(200, resp)
+	return c.JSON(http.StatusOK, resp)
 }
+
 func (s *Server) webhook(c echo.Context) error {
-	n := c.Request().ContentLength
-	if n < 0 {
-		n = 0
+	// The signature covers the exact bytes Paystack sent, so the raw body must
+	// be read in full before anything else touches it. The previous single
+	// Body.Read call trusted Content-Length and ignored short reads, which
+	// silently truncated the payload and broke both parsing and signature
+	// verification.
+	body, err := io.ReadAll(http.MaxBytesReader(c.Response(), c.Request().Body, maxRequestBody))
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, errorBody("could not read body"))
 	}
-	body := make([]byte, n)
-	_, err := c.Request().Body.Read(body)
-	if err != nil && err != io.EOF {
-		return c.JSON(400, map[string]string{"error": "could not read body"})
+
+	err = s.Subscriptions.HandleWebhook(c.Request().Context(), body, c.Request().Header.Get("x-paystack-signature"))
+	switch {
+	case errors.Is(err, payments.ErrInvalidSignature):
+		s.logger().WarnContext(c.Request().Context(), "rejected webhook with invalid signature", "bytes", len(body))
+		return c.JSON(http.StatusUnauthorized, errorBody("invalid signature"))
+	case errors.Is(err, service.ErrUnknownSubscription):
+		// Nothing to apply and a retry will not change that.
+		s.logger().WarnContext(c.Request().Context(), "webhook for unknown subscription", "error", err)
+		return c.JSON(http.StatusNotFound, errorBody("subscription not found"))
+	case errors.Is(err, payments.ErrUnsupportedEvent):
+		// Acknowledged so the provider stops retrying an event we ignore.
+		return c.NoContent(http.StatusOK)
+	case err != nil:
+		s.logger().ErrorContext(c.Request().Context(), "webhook processing failed", "error", err)
+		return c.JSON(http.StatusBadRequest, errorBody(err.Error()))
 	}
-	if err := s.Subscriptions.HandleWebhook(c.Request().Context(), body, c.Request().Header.Get("x-paystack-signature")); err != nil {
-		if errors.Is(err, payments.ErrInvalidSignature) {
-			return c.JSON(401, map[string]string{"error": "invalid signature"})
-		}
-		return c.JSON(400, map[string]string{"error": err.Error()})
-	}
-	return c.NoContent(200)
+	return c.NoContent(http.StatusOK)
 }
+
 func (s *Server) getSubscription(c echo.Context) error {
-	sub, err := s.Subscriptions.Store.GetSubscription(c.Param("userID"))
+	sub, err := s.Subscriptions.Get(c.Param("userID"))
 	if errors.Is(err, store.ErrNotFound) {
-		return c.JSON(404, map[string]string{"error": "subscription not found"})
+		return c.JSON(http.StatusNotFound, errorBody("subscription not found"))
 	}
 	if err != nil {
-		return c.JSON(500, map[string]string{"error": "internal error"})
+		s.logger().ErrorContext(c.Request().Context(), "get subscription failed", "user_id", c.Param("userID"), "error", err)
+		return c.JSON(http.StatusInternalServerError, errorBody("internal error"))
 	}
-	return c.JSON(200, sub)
+	return c.JSON(http.StatusOK, sub)
 }
