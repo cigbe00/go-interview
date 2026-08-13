@@ -258,7 +258,8 @@ func (s *Server) webhook(c echo.Context) error {
 		// Deliberately not acknowledged. Money may have moved without a
 		// subscription to apply it to, so Paystack should retry: the event was
 		// not consumed, and a redelivery succeeds once the subscription
-		// exists. This needs to alert — see PULL_REQUEST.md.
+		// exists. Logged at error level because this should page — it means a
+		// payment succeeded that we could not attribute to an account.
 		s.logger().ErrorContext(c.Request().Context(), "webhook could not be matched to a subscription", "error", err)
 		return c.JSON(http.StatusNotFound, errorBody(msgSubscriptionMissing))
 	case errors.Is(err, payments.ErrUnsupportedEvent):

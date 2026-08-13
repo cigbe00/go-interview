@@ -176,9 +176,10 @@ func TestConcurrentReadsAndWritesStayConsistent(t *testing.T) {
 	}
 
 	// A reader that loaded from the store just before a write can repopulate
-	// the cache after that write's invalidation, so the cached copy may lag by
-	// design (documented in PULL_REQUEST.md). One more write clears it, and
-	// with no readers racing, the next read must agree with the store exactly.
+	// the cache after that write's invalidation, so the cached copy may lag: a
+	// known limitation of cache-aside, bounded by the TTL. One more write
+	// clears it, and with no readers racing, the next read must agree with the
+	// store exactly.
 	if _, err := svc.CreateReview(ctx, "biz_1", "user_c", 4, "Good"); err != nil {
 		t.Fatal(err)
 	}
