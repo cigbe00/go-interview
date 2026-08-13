@@ -16,6 +16,7 @@ type Config struct {
 	RedisBusinessTTL   time.Duration
 	GoogleClientID     string
 	GoogleTokenInfoURL string
+	GoogleTimeout      time.Duration
 	PaystackSecretKey  string
 	PaystackBaseURL    string
 	PaystackTimeout    time.Duration
@@ -31,6 +32,7 @@ func Load() Config {
 		RedisBusinessTTL:   time.Duration(envInt("REDIS_BUSINESS_TTL_SECONDS", 300)) * time.Second,
 		GoogleClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
 		GoogleTokenInfoURL: env("GOOGLE_TOKENINFO_URL", "https://oauth2.googleapis.com/tokeninfo"),
+		GoogleTimeout:      time.Duration(envInt("GOOGLE_HTTP_TIMEOUT_SECONDS", 5)) * time.Second,
 		PaystackSecretKey:  os.Getenv("PAYSTACK_SECRET_KEY"),
 		PaystackBaseURL:    env("PAYSTACK_BASE_URL", "https://api.paystack.co"),
 		PaystackTimeout:    time.Duration(envInt("PAYSTACK_HTTP_TIMEOUT_SECONDS", 5)) * time.Second,

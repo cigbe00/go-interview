@@ -5,15 +5,20 @@ import (
 	"errors"
 	"github.com/maoni/backend-takehome/internal/auth"
 	"github.com/maoni/backend-takehome/internal/model"
-	"github.com/maoni/backend-takehome/internal/store"
 	"strings"
 )
 
 var ErrEmailMissing = errors.New("verified identity did not include email")
 var ErrSubjectMissing = errors.New("verified identity did not include subject")
 
+// UserRepository is the persistence surface AuthService depends on. UpsertUser
+// resolves a verified provider identity to a stable local account.
+type UserRepository interface {
+	UpsertUser(u model.User) model.User
+}
+
 type AuthService struct {
-	Store    *store.MemoryStore
+	Store    UserRepository
 	Verifier auth.TokenVerifier
 }
 
