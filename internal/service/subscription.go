@@ -60,7 +60,12 @@ func (s *SubscriptionService) Initialize(ctx context.Context, userID, email, pla
 		return payments.InitializeResponse{}, fmt.Errorf("%w: amount must be greater than zero", ErrInvalidSubscriptionRequest)
 	}
 
-	ref := fmt.Sprintf("maoni_%s_%d", userID, time.Now().UnixNano())
+	// The user ID stays in the reference so a transaction can be traced back to
+	// an account from the Paystack dashboard. It must also be unique: two
+	// checkouts started at the same instant by one user would otherwise share a
+	// reference, which Paystack rejects as a duplicate transaction and which
+	// would make the callback ambiguous.
+	ref := newID("maoni_" + userID)
 	resp, err := s.Provider.Initialize(ctx, payments.InitializeRequest{
 		UserID:    userID,
 		Email:     email,

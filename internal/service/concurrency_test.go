@@ -190,3 +190,80 @@ func TestConcurrentReadsAndWritesStayConsistent(t *testing.T) {
 		t.Fatalf("read-back review_count = %d, want %d", b.ReviewCount, wantCount+1)
 	}
 }
+
+// Identifiers must be unique under concurrency. time.Now().UnixNano() alone is
+// not: the clock's resolution is coarser than a nanosecond on some platforms,
+// so simultaneous writers can read the same instant. A duplicate review ID is
+// a duplicate primary key against a real database.
+func TestConcurrentWritesMintUniqueIdentifiers(t *testing.T) {
+	const writers = 200
+
+	st := store.NewMemoryStore()
+	svc := &service.BusinessService{Store: st, Cache: cache.NewMemoryBusinessCache(), CacheTTL: time.Minute}
+	subs := &service.SubscriptionService{
+		Store:    st,
+		Provider: referenceEchoProvider{},
+	}
+	ctx := context.Background()
+
+	reviewIDs := make([]string, writers)
+	references := make([]string, writers)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			r, err := svc.CreateReview(ctx, "biz_1", "user_c", 5, "Great")
+			if err != nil {
+				t.Errorf("create review: %v", err)
+				return
+			}
+			reviewIDs[i] = r.ID
+
+			// Same user every time: the reference must still be unique.
+			resp, err := subs.Initialize(ctx, "usr_same", "user@example.com", "PLN_x", 1000)
+			if err != nil {
+				t.Errorf("initialize: %v", err)
+				return
+			}
+			references[i] = resp.Reference
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	assertAllUnique(t, "review ID", reviewIDs)
+	assertAllUnique(t, "transaction reference", references)
+}
+
+func assertAllUnique(t *testing.T, label string, values []string) {
+	t.Helper()
+	seen := make(map[string]int, len(values))
+	for i, v := range values {
+		if v == "" {
+			t.Fatalf("%s %d was never assigned", label, i)
+		}
+		if first, dup := seen[v]; dup {
+			t.Fatalf("%s collision: writers %d and %d both got %q", label, first, i, v)
+		}
+		seen[v] = i
+	}
+}
+
+// referenceEchoProvider returns the reference it was given, the way Paystack
+// does, so the caller's generated reference is what ends up stored.
+type referenceEchoProvider struct{}
+
+func (referenceEchoProvider) Initialize(_ context.Context, in payments.InitializeRequest) (payments.InitializeResponse, error) {
+	return payments.InitializeResponse{
+		AuthorizationURL: "https://checkout.paystack.com/" + in.Reference,
+		AccessCode:       "acc",
+		Reference:        in.Reference,
+	}, nil
+}
+func (referenceEchoProvider) VerifyWebhookSignature([]byte, string) error { return nil }
+func (referenceEchoProvider) ParseWebhook([]byte) (payments.WebhookEvent, error) {
+	return payments.WebhookEvent{}, nil
+}

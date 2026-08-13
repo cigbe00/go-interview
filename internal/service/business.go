@@ -117,7 +117,7 @@ func (s *BusinessService) CreateReview(ctx context.Context, businessID, userID s
 	}
 
 	r := model.Review{
-		ID:         fmt.Sprintf("rev_%d", time.Now().UnixNano()),
+		ID:         newID("rev"),
 		BusinessID: businessID,
 		UserID:     userID,
 		Rating:     rating,
