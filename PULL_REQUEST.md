@@ -39,6 +39,7 @@ Each root cause below has a regression test that fails against the original code
 | Review validation | A review could be created with no `user_id` and an unbounded body | `user_id` required, body capped |
 | Cache TTL | `CacheTTL` was passed to Redis unchecked, and go-redis treats a zero expiration as **no expiry**. An unset TTL — or `REDIS_BUSINESS_TTL_SECONDS=0` — would have cached every business permanently, silently removing the backstop that bounds how long a failed invalidation can serve stale data | Non-positive TTL falls back to a positive default |
 | Failed writes | A review write that failed still invalidated the cache, turning a write that never happened into avoidable load on the store | Invalidate only after a successful write |
+| Duplicate identifiers | `fmt.Sprintf("rev_%d", time.Now().UnixNano())` is **not unique**. The clock's resolution is coarser than a nanosecond, so two concurrent writers read the same instant and mint the same review ID — reproducible in about one run in three at 40 concurrent writers. Against MongoDB that is a duplicate `_id`: a failed write, or one review silently overwriting another. The same flaw applied to Paystack transaction references, where a collision means a duplicate transaction and an ambiguous callback | Time-ordered IDs with a random suffix ([id.go](internal/service/id.go)) |
 | Error leakage | Rejected sign-ins and unprocessable webhooks echoed internal detail (which validation rule failed, parser errors) back to the caller | Fixed client-facing messages; detail is logged |
 | `.env.example` | Referenced by both the README and `make setup`, but absent from the repository | Added |
 
@@ -77,7 +78,25 @@ Starter tests still pass unchanged. The whole suite passes under `-race`.
 - **Concurrency (`internal/service`, `internal/api`)** — run under `-race`: 32 simultaneous redeliveries of one webhook apply exactly once; 16 distinct concurrent events all apply; 40 concurrent review writes leave exact aggregates and no lost records; mixed traffic across every endpoint never returns 5xx.
 - **`internal/config`** — defaults, environment overrides, malformed numbers falling back rather than becoming zero, `.env` parsing including quoted values, and a real environment variable winning over the file.
 
+- **Robustness (`internal/api`)** — oversized bodies rejected without being buffered, malformed and mistyped requests never producing a 5xx, unicode surviving a round trip, pagination exhaustive and non-overlapping for *every* page size from 1 to 7, the API still serving reads and writes with Redis down, a hanging provider surfacing as a bounded 502 rather than a hung connection, and a datastore outage returning 500 without leaking driver detail.
+- **Fuzzing** — `FuzzParseWebhook`, `FuzzVerifyWebhookSignature` and `FuzzVerifyTokenInfoResponse`. These are the untrusted-input boundaries: the webhook endpoint is public, and the parser runs before anything has authenticated the bytes. The properties asserted are more than "does not panic": every rejection must be a *classified* error the caller can act on, no accepted event may lack an idempotency key or status, no accepted identity may lack a subject or email, and no signature may be accepted unless it really is the HMAC of that exact body. Roughly **8.8 million executions** across the three targets found no crashers and no false accepts. They run as ordinary tests from the seed corpus, so CI needs no fuzzing budget.
+
 No test requires network access or real credentials.
+
+### Coverage and static analysis
+
+| Package | Coverage |
+|---|---|
+| `internal/cache` | 100% |
+| `internal/config` | 100% |
+| `internal/service` | 95.0% |
+| `internal/api` | 92.4% |
+| `internal/store` | 91.5% |
+| `internal/payments` | 87.3% |
+| `internal/auth` | 86.9% |
+| `internal/rediscache` | 83.3% |
+
+`gofmt`, `go vet`, `staticcheck` and `golangci-lint` are all clean, and the suite passes under `-race`.
 
 ### Verifying the tests actually catch the bugs
 
@@ -100,6 +119,19 @@ A test that never fails proves nothing, so I re-introduced each defect and confi
 | Google expiry check bypassed | ✅ |
 | Unverified email accepted | ✅ |
 | Zero cache TTL passed through to Redis | ✅ |
+
+### On the size of this diff
+
+The README says a small, correct, well-tested change scores higher than a large rewrite, so it is worth being explicit about what the line count is made of:
+
+| | Lines |
+|---|---|
+| Tests | +3,333 |
+| Production code | +1,211 / −146 |
+| — of which Tasks 3 and 4 (`paystack.go`, `google.go`) | +480 |
+| Docs and config (`PULL_REQUEST.md`, `.env.example`, `requests.http`) | +246 |
+
+Roughly three quarters of the diff is tests. Of the production code, the two provider integrations account for nearly half and were unimplemented stubs returning `ErrNotImplemented` — that code had to be written to complete the exercise. What is left is the focused bug fixes, and a meaningful share of *those* lines are comments recording the root cause at the site of each fix. No file was rewritten, no framework replaced, and no existing abstraction discarded.
 
 ---
 
@@ -133,11 +165,12 @@ A test that never fails proves nothing, so I re-introduced each defect and confi
 ## 6. What I would do next with more time
 
 1. Swap tokeninfo for local JWK-based ID-token validation, keeping the interface identical.
-2. Persist to MongoDB behind a repository interface, and make the webhook apply-and-mark a single transaction so idempotency and the state change commit together.
-3. Add authentication middleware and per-user rate limiting on review creation.
-4. Replay-protect webhooks with a timestamp window in addition to the signature, and record every raw delivery for audit before processing.
-5. Contract tests against Paystack's sandbox, run outside the unit suite.
-6. Add `Retry-After` and a small backoff-aware client for provider calls, plus a circuit breaker so a Paystack outage degrades checkout rather than saturating request threads.
+2. Wire the fuzz targets into CI with a time budget and a persisted corpus, so the untrusted-input boundaries keep getting explored between releases rather than only from the seed corpus.
+3. Persist to MongoDB behind the repository interfaces already defined, and make the webhook apply-and-mark a single transaction so idempotency and the state change commit together.
+4. Add authentication middleware and per-user rate limiting on review creation.
+5. Replay-protect webhooks with a timestamp window in addition to the signature, and record every raw delivery for audit before processing.
+6. Contract tests against Paystack's sandbox, run outside the unit suite.
+7. Add `Retry-After` and a small backoff-aware client for provider calls, plus a circuit breaker so a Paystack outage degrades checkout rather than saturating request threads.
 
 ---
 

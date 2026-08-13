@@ -517,3 +517,5 @@ func intOf(v any) (int, bool) {
 	f, ok := v.(float64)
 	return int(f), ok
 }
+
+func jsonPayload(v map[string]any) ([]byte, error) { return json.Marshal(v) }
