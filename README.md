@@ -1,277 +1,165 @@
-# Maoni Senior Backend Engineer — Practical Exercise
+# Maoni Backend API
 
-## Why this exercise exists
+A focused Go backend that demonstrates reliable review aggregation, cache consistency, Google identity verification, and a secure Paystack subscription flow. The implementation keeps the original handler → service → store/provider boundaries while fixing the deliberately seeded defects with small, testable changes.
 
-Maoni is evaluating your ability to inherit an unfamiliar Go backend, understand it with minimal supervision, diagnose production-style failures, make focused fixes, integrate external providers safely, and leave the codebase more reliable than you found it.
+## Engineering highlights
 
-This repository is intentionally small and uses **mock application data only**. It does **not** connect to Maoni production systems or databases. Redis runs locally in Docker. You do not need—and should not request—Maoni Redis, Google, Paystack, AWS, database, or other production credentials.
+- Correct, concurrency-safe review writes and derived rating statistics
+- Cache-aside reads with best-effort Redis invalidation after successful writes
+- Context-aware Google and Paystack requests with bounded clients and response bodies
+- Google claim validation for audience, issuer, expiry, stable subject, and verified email
+- HMAC-SHA512 Paystack webhook verification using the unmodified request body
+- Atomic webhook correlation and idempotency based on event ID, user metadata, transaction reference, and plan
+- Strict JSON decoding, 1 MiB request limits, validated pagination, and server timeouts
+- Provider tests use `httptest.Server`; no real credentials or outbound calls are required
 
-The application mirrors patterns relevant to our backend: Go, REST APIs, handler/service/repository separation, Redis caching, authentication integration, payment/subscription integration, background-safe/idempotent thinking, and production debugging.
+## Architecture
 
-> Some behavior is deliberately incorrect. The repository should compile and its starter tests should pass; the bugs are intentionally under-tested. Part of the assessment is writing tests that reproduce the reported symptoms before or while fixing them.
-
-## Expected time
-
-Please aim for approximately **3–4 focused hours**. We care more about correctness, reasoning, tests, and maintainability than the amount of code written. If you run out of time, document what remains and how you would approach it.
-
-## Prerequisites
-
-- Go **1.23+**
-- Git
-- Docker Desktop or Docker Engine with `docker compose`
-- `curl` (optional; `requests.http` is also provided)
-
-## Quick start
-
-### 1. Clone and create your branch
-
-```bash
-git clone <repository-url>
-cd maoni-backend-takehome
-git checkout -b candidate/<your-name>
+```text
+HTTP / Echo
+    │
+    ├── BusinessService ── MemoryStore
+    │         └─────────── Redis business cache
+    │
+    ├── AuthService ────── Google TokenInfo verifier
+    │         └─────────── MemoryStore
+    │
+    └── SubscriptionService ── Paystack client
+              └─────────────── MemoryStore
 ```
 
-### 2. Create local environment configuration
+The in-memory store is intentional for this exercise. Provider and cache boundaries are interfaces, so core service behavior is tested without infrastructure, while HTTP provider behavior is exercised against local mock servers.
+
+## Root causes and fixes
+
+| Symptom | Root cause | Resolution |
+|---|---|---|
+| `GET /businesses/biz_1` returned `404` | The store compared the route ID only with each business slug | Resolve the map key first and retain slug lookup as a convenience |
+| A created review did not affect statistics | Reviews were written to `review`, but reads used `reviews` | Use the shared collection constant for reads and writes |
+| Average ratings lost precision | Integer division occurred before conversion to `float64` | Convert operands before division |
+| Page 1 skipped records | Offset was calculated as `page * limit` | Use the one-based offset `(page - 1) * limit` |
+| Business data stayed stale after a review | The cache entry survived the authoritative write | Evict the affected business after the review commits |
+| Google users could be merged by email | User storage treated email as the identity key | Key Google users by the provider's stable `sub` claim |
+| Webhooks could update the wrong user | The service used the customer email as `userID` | Correlate signed metadata `user_id` with the pending reference and plan |
+| Duplicate/invalid events could corrupt state | Event marking and subscription writes were separate and weakly correlated | Validate and apply the event atomically under the store lock |
+| Chunked webhook bodies could be truncated | The handler allocated from `Content-Length` and called `Read` once | Use a bounded `io.ReadAll` over the raw body |
+
+Cache failures never change the result of an authoritative store operation. A cache read error becomes a miss; a cache set or delete error is best effort. In a production service these failures would also emit metrics and structured logs.
+
+## Run locally
+
+### Prerequisites
+
+- Go 1.23+
+- Docker with Compose
+- `curl` or an HTTP client that supports [`requests.http`](requests.http)
+
+### Setup
 
 ```bash
 cp .env.example .env
-```
-
-The supplied values are local/placeholder values. **Do not add real secrets to Git.**
-
-### 3. Start Redis locally
-
-```bash
 docker compose up -d redis
-```
-
-Confirm it is healthy:
-
-```bash
 docker compose exec redis redis-cli ping
-```
-
-Expected output:
-
-```text
-PONG
-```
-
-Redis is local only. The default address is `localhost:6379`, with no password. No Maoni Redis credentials are required.
-
-If port `6379` is already in use, you may choose another host port, for example:
-
-```bash
-REDIS_PORT=6380 docker compose up -d redis
-```
-
-and update `REDIS_ADDR` in `.env` to `localhost:6380`.
-
-### 4. Download Go dependencies
-
-```bash
 go mod download
-```
-
-### 5. Run the starter tests
-
-```bash
 go test ./...
-```
-
-The provided starter tests are expected to pass. They do **not** cover all known defects. Add tests for the defects you fix and for the integrations you implement.
-
-### 6. Run the API
-
-```bash
 go run ./cmd/api
 ```
 
-The application loads `.env` automatically when present and starts on:
-
-```text
-http://localhost:8080
-```
-
-### 7. Health check
+The API listens on `http://localhost:8080`. A healthy local response is:
 
 ```bash
 curl http://localhost:8080/health
 ```
 
-Expected response:
-
 ```json
-{"status":"ok"}
+{"redis":true,"status":"ok"}
 ```
 
-The health response also reports whether the application was able to connect to Redis.
+If Redis is unavailable at startup, the service logs the failure and continues with a no-op cache. The health endpoint reports `redis: false` while the API remains available.
 
----
+If port `6379` is occupied:
 
-# Tasks to be completed
-
-## Task 1 — Debug the existing REST API
-
-Several user-visible behaviors are incorrect. Investigate the code and fix the **root causes**, not just the returned JSON.
-
-Known symptoms include:
-
-1. A seeded business can unexpectedly return `404` when requested by its documented ID.
-2. Creating a review can return `201 Created`, but the business's review count and/or average rating does not reliably reflect the new review.
-3. A business's average rating can lose precision.
-4. Review pagination can skip records or return an unexpected page.
-5. After data changes, a subsequent business request may continue returning stale information for a period of time.
-
-There may be other issues you notice. Fix anything materially incorrect that you can justify, and explain it in the Pull Request.
-
-### What we are evaluating
-
-- How you trace a symptom through handler -> service -> data/cache/provider layers
-- Whether you identify the actual root cause(s)
-- Whether your fixes preserve data consistency
-- Whether you add regression tests
-- Whether your changes are focused rather than a rewrite
-
----
-
-## Task 2 — Redis cache behavior
-
-Redis support and local Docker setup are already provided. You are **not** expected to build Redis infrastructure from scratch.
-
-Review how business responses are cached and make the behavior production-sensible.
-
-At minimum:
-
-- Correct stale-cache behavior when a review changes business-derived data.
-- Preserve sensible cache keying and TTL behavior.
-- Avoid making a transient cache failure corrupt application data.
-- Add tests around the cache-dependent behavior you fix. A fake cache is acceptable for service tests; an optional local Redis integration test is welcome.
-
-Do not use any remote Redis instance or Maoni credentials.
-
----
-
-## Task 3 — Implement Google sign-in verification
-
-Complete the Google ID-token verification path behind the existing `auth.TokenVerifier` interface.
-
-For this exercise, the starter includes an injectable Google token-info URL so your implementation can be tested against `httptest.Server` without Google credentials or live network calls. In your PR, briefly note whether you would use the same mechanism in production or switch to Google's server-side ID-token/JWK validation library.
-
-Requirements:
-
-- Do not hard-code credentials or client IDs.
-- Read the configured audience/client ID from environment-backed configuration.
-- Respect request context and use an HTTP client with a timeout.
-- Reject empty or invalid tokens.
-- Validate that the returned token audience matches the configured Google client ID.
-- Validate issuer and expiration information.
-- Require a stable Google subject (`sub`) and a usable, verified email identity.
-- Normalize the provider response into the existing `auth.Identity` model.
-- Return sensible errors for invalid tokens versus provider/network failures.
-- Add tests using a local/mock HTTP server. Tests must not require real Google credentials or outbound internet access.
-
-Important: do not use email as the provider's stable account identifier; preserve Google's `sub` identifier.
-
----
-
-## Task 4 — Implement Paystack transaction/subscription flow
-
-Complete the Paystack client and subscription flow behind the existing payment interfaces. You do **not** need a Maoni Paystack key and should not call live Paystack from automated tests.
-
-Requirements:
-
-- Implement transaction initialization using the configured base URL and secret key.
-- Send provider authentication correctly and use JSON request/response handling.
-- Support the supplied plan code and preserve correlation to the Maoni user initiating the subscription.
-- Use context-aware HTTP requests and a reasonable timeout.
-- Handle non-2xx responses, provider-declared failures, malformed JSON, and missing required response data safely.
-- Verify Paystack webhook origin using the `x-paystack-signature` value and the raw request body.
-- Parse the relevant webhook payload into the existing normalized event model.
-- Make webhook processing idempotent so a duplicate delivery cannot apply the same subscription change twice.
-- Ensure a webhook updates the correct Maoni subscription/user rather than relying on an unsafe identity assumption.
-- Add tests with `httptest.Server` or equivalent. No live Paystack calls are required.
-
-You may implement only the webhook event types necessary to demonstrate a sound subscription/payment flow; document what additional events you would support in production.
-
----
-
-## Task 5 — Improve API robustness where appropriate
-
-We will also look for pragmatic senior-level improvements you notice while working, such as:
-
-- Correct request validation and HTTP status codes
-- Safe request-body handling
-- Context propagation and timeouts
-- Clear error boundaries between provider, service, and API layers
-- Useful logging/observability hooks
-- Safe concurrency and idempotency
-- Appropriate tests
-- Avoiding unnecessary abstractions or broad rewrites
-
-Please do **not** replace Echo, change the exercise into another framework, or rewrite the entire application. We want to evaluate how you improve an inherited codebase.
-
----
-
-# Useful endpoints
-
-```text
-GET  /health
-GET  /api/v1/businesses/:id
-GET  /api/v1/businesses/:id/reviews?page=1&limit=10
-POST /api/v1/businesses/:id/reviews
-POST /api/v1/auth/google
-POST /api/v1/subscriptions/initialize
-POST /api/v1/subscriptions/webhook
-GET  /api/v1/subscriptions/:userID
+```bash
+REDIS_PORT=6380 docker compose up -d redis
 ```
 
-Example requests are available in [`requests.http`](requests.http).
+Then set `REDIS_ADDR=localhost:6380` in `.env`.
 
-## Useful seeded data
+## Configuration
 
-```text
-Business ID: biz_1
-Business ID: biz_2
+Configuration is loaded from the environment; an untracked `.env` is loaded for local development.
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `PORT` | `8080` | HTTP listen port |
+| `REDIS_ADDR` | `localhost:6379` | Redis address |
+| `REDIS_PASSWORD` | empty | Redis password |
+| `REDIS_DB` | `0` | Redis database |
+| `REDIS_BUSINESS_TTL_SECONDS` | `300` | Cached business TTL |
+| `GOOGLE_CLIENT_ID` | empty | Expected Google ID-token audience |
+| `GOOGLE_TOKENINFO_URL` | Google TokenInfo endpoint | Injectable verification endpoint |
+| `PAYSTACK_SECRET_KEY` | empty | API authentication and webhook signing key |
+| `PAYSTACK_BASE_URL` | `https://api.paystack.co` | Injectable Paystack API base URL |
+| `PAYSTACK_HTTP_TIMEOUT_SECONDS` | `5` | External-provider request timeout |
+
+Do not commit real credentials. Automated tests require none.
+
+## API
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/health` | API and Redis reachability |
+| `GET` | `/api/v1/businesses/:id` | Business with derived review statistics |
+| `GET` | `/api/v1/businesses/:id/reviews?page=1&limit=10` | Reviews ordered newest first |
+| `POST` | `/api/v1/businesses/:id/reviews` | Create a 1–5 star review |
+| `POST` | `/api/v1/auth/google` | Verify a Google ID token and upsert its user |
+| `POST` | `/api/v1/subscriptions/initialize` | Initialize a Paystack plan transaction |
+| `POST` | `/api/v1/subscriptions/webhook` | Process a signed `charge.success` event |
+| `GET` | `/api/v1/subscriptions/:userID` | Read subscription state |
+
+Seeded businesses are `biz_1` and `biz_2`. See [`requests.http`](requests.http) for ready-to-run examples.
+
+### Review example
+
+```bash
+curl -X POST http://localhost:8080/api/v1/businesses/biz_1/reviews \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id":"user_99","rating":5,"body":"Great place"}'
 ```
 
-The mock repository is reset each time the API process restarts. Redis may retain cached values until its TTL expires; use `docker compose exec redis redis-cli FLUSHDB` if you intentionally need a clean cache during development.
+### Paystack flow
 
----
+1. Initialization creates an application reference and sends email, amount, plan, reference, and `metadata.user_id` to Paystack.
+2. A pending subscription is stored only after Paystack returns all required fields.
+3. The webhook handler reads the exact raw body and verifies `x-paystack-signature` with HMAC-SHA512.
+4. A successful `charge.success` event is normalized to `active` only when its signed user metadata, transaction reference, and plan correlate with the pending subscription.
+5. Applying the state transition and recording the event ID occur in one critical section, making retries idempotent.
 
-# Submission instructions
+## Verification
 
-1. Work on your own branch.
-2. Commit changes with meaningful commit messages.
-3. Push your branch and open a Pull Request to the provided repository.
-4. Do not commit `.env`, credentials, generated binaries, or unrelated files.
-5. Keep the application runnable locally using the documented setup.
+```bash
+make test       # unit and provider-contract tests
+make test-race  # concurrency verification
+make vet        # static analysis
+make check      # test + vet
+```
 
-Your Pull Request description must include:
+Regression coverage includes business ID lookup, saved-review visibility, rating precision, pagination, cache invalidation, Google claim validation and provider failures, Paystack authentication/payload handling, webhook signatures, correlation, and duplicate delivery.
 
-- The bugs/root causes you identified
-- What you changed and why
-- Tests you added
-- Trade-offs or assumptions you made
-- Any known remaining issues
-- What you would improve next with more time
-- How you would monitor the review, Google-auth, Redis, and Paystack flows in production
+## Production considerations
 
-## Evaluation priorities
+This submission deliberately avoids a broad rewrite, but the next production steps are clear:
 
-We prioritize:
+- Replace `MemoryStore` with a transactional database repository. Enforce unique provider-subject and payment-event constraints in the database so correctness holds across replicas.
+- Use an outbox/inbox pattern for durable webhook ingestion and asynchronous processing. Return success only after durable receipt, then retry state transitions safely.
+- Prefer Google's server-side ID-token/JWK validation library in production. The TokenInfo approach remains here because its injectable URL makes the exercise deterministic without network access.
+- Support additional Paystack lifecycle events such as failed charges, cancellations, renewals, and plan changes through an explicit state machine.
+- Authenticate application endpoints and derive `user_id` from the authenticated principal rather than accepting it from public request JSON.
+- Add structured logs, traces, and metrics for request latency/error rate, cache hits and failures, provider latency/status, signature failures, webhook duplicates, and event processing lag. Alert on sustained provider errors, cache degradation, and webhook backlog.
+- Add graceful shutdown and separate liveness/readiness probes. Redis should remain an optional dependency for liveness and an observable dependency for readiness according to deployment policy.
 
-1. Debugging/root-cause reasoning
-2. Correctness and data consistency
-3. Go/API code quality
-4. Redis/cache correctness
-5. Paystack integration and webhook safety
-6. Google authentication implementation
-7. Tests and regression prevention
-8. Communication, documentation, and scope judgment
+## Trade-offs
 
-A small, correct, well-tested change will score higher than a large rewrite.
-
-## Security and confidentiality
-
-This repository contains no Maoni production data or secrets. Do not add any real production credential to the project. If you choose to use your own provider test credentials for manual exploration, keep them only in your untracked `.env` file.
+- Cache invalidation happens after the store write. A transient delete failure can leave data stale until the TTL, but never rolls back or misreports a successful review write. A versioned key or transactional outbox would close that window in a distributed deployment.
+- Idempotency is process-local because persistence is in memory. The atomic contract is correct for this implementation; production durability belongs in a database unique constraint.
+- Only `charge.success` is normalized because it is sufficient to demonstrate the subscription activation path safely. Unsupported event types are rejected explicitly instead of being guessed into state changes.

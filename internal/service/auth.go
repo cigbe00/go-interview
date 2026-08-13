@@ -25,10 +25,10 @@ func (s *AuthService) SignInGoogle(ctx context.Context, token string) (model.Use
 	if err != nil {
 		return model.User{}, err
 	}
-	if id.Subject == "" {
+	if strings.TrimSpace(id.Subject) == "" {
 		return model.User{}, ErrSubjectMissing
 	}
-	if id.Email == "" {
+	if strings.TrimSpace(id.Email) == "" {
 		return model.User{}, ErrEmailMissing
 	}
 	return s.Store.UpsertUser(model.User{Email: id.Email, Name: id.Name, GoogleID: id.Subject}), nil
