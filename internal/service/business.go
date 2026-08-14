@@ -4,10 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
+
 	"github.com/maoni/backend-takehome/internal/cache"
 	"github.com/maoni/backend-takehome/internal/model"
 	"github.com/maoni/backend-takehome/internal/store"
-	"time"
 )
 
 var ErrInvalidRating = errors.New("rating must be between 1 and 5")
@@ -18,16 +19,29 @@ type BusinessService struct {
 	CacheTTL time.Duration
 }
 
-func (s *BusinessService) GetBusiness(ctx context.Context, id string) (model.Business, error) {
-	if s.Cache != nil {
-		if b, ok, err := s.Cache.GetBusiness(ctx, id); err == nil && ok {
-			return b, nil
-		}
+func NewBusinessService(s *store.MemoryStore, c cache.BusinessCache, ttl time.Duration) *BusinessService {
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
 	}
+	return &BusinessService{
+		Store:    s,
+		Cache:    c,
+		CacheTTL: ttl,
+	}
+}
+
+func (s *BusinessService) GetBusiness(ctx context.Context, id string) (model.Business, error) {
 	b, err := s.Store.GetBusiness(id)
 	if err != nil {
 		return model.Business{}, err
 	}
+
+	if s.Cache != nil {
+		if b, ok, err := s.Cache.GetBusiness(ctx, b.ID); err == nil && ok {
+			return b, nil
+		}
+	}
+
 	count, avg := s.Store.ReviewStats(b.ID)
 	b.ReviewCount, b.Average = count, avg
 	if s.Cache != nil {
@@ -39,13 +53,24 @@ func (s *BusinessService) CreateReview(ctx context.Context, businessID, userID s
 	if rating < 1 || rating > 5 {
 		return model.Review{}, ErrInvalidRating
 	}
-	if _, err := s.Store.GetBusinessRaw(businessID); err != nil {
+
+	b, err := s.Store.GetBusinessRaw(businessID)
+	if err != nil {
 		return model.Review{}, err
 	}
-	r := model.Review{ID: fmt.Sprintf("rev_%d", time.Now().UnixNano()), BusinessID: businessID, UserID: userID, Rating: rating, Body: body, CreatedAt: time.Now().UTC()}
+
+	r := model.Review{ID: fmt.Sprintf("rev_%d", time.Now().UnixNano()), BusinessID: b.ID, UserID: userID, Rating: rating, Body: body, CreatedAt: time.Now().UTC()}
 	if err := s.Store.SaveReview(r); err != nil {
 		return model.Review{}, err
 	}
+
+	if s.Cache != nil {
+		_ = s.Cache.DeleteBusiness(ctx, b.ID)
+		if b.Slug != "" {
+			_ = s.Cache.DeleteBusiness(ctx, b.Slug)
+		}
+	}
+
 	return r, nil
 }
 func (s *BusinessService) ListReviews(businessID string, page, limit int) []model.Review {
