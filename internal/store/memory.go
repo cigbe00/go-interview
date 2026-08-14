@@ -2,10 +2,11 @@ package store
 
 import (
 	"errors"
-	"github.com/maoni/backend-takehome/internal/model"
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/maoni/backend-takehome/internal/model"
 )
 
 var ErrNotFound = errors.New("not found")
@@ -46,7 +47,7 @@ func (s *MemoryStore) GetBusiness(id string) (model.Business, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, b := range s.businesses {
-		if b.Slug == id {
+		if b.ID == id {
 			return b, nil
 		}
 	}
@@ -64,7 +65,7 @@ func (s *MemoryStore) GetBusinessRaw(id string) (model.Business, error) {
 func (s *MemoryStore) SaveReview(r model.Review) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.collections["review"] = append(s.collections["review"], r)
+	s.collections[ReviewsCollection] = append(s.collections[ReviewsCollection], r)
 	return nil
 }
 func (s *MemoryStore) ListReviews(businessID string, page, limit int) []model.Review {
@@ -77,14 +78,17 @@ func (s *MemoryStore) ListReviews(businessID string, page, limit int) []model.Re
 		}
 	}
 	sort.Slice(matches, func(i, j int) bool { return matches[i].CreatedAt.After(matches[j].CreatedAt) })
-	start := page * limit
+
+	pageOffSet := page
+	if pageOffSet > 0 {
+		pageOffSet--
+	}
+
+	start := pageOffSet * limit
 	if start >= len(matches) {
 		return []model.Review{}
 	}
-	end := start + limit
-	if end > len(matches) {
-		end = len(matches)
-	}
+	end := min(start+limit, len(matches))
 	return append([]model.Review(nil), matches[start:end]...)
 }
 func (s *MemoryStore) ReviewStats(businessID string) (int, float64) {
@@ -100,7 +104,7 @@ func (s *MemoryStore) ReviewStats(businessID string) (int, float64) {
 	if count == 0 {
 		return 0, 0
 	}
-	return count, float64(total / count)
+	return count, float64(total) / float64(count)
 }
 func (s *MemoryStore) UpsertUser(u model.User) model.User {
 	s.mu.Lock()
