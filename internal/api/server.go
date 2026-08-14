@@ -2,14 +2,15 @@ package api
 
 import (
 	"errors"
+	"io"
+	"net/http"
+	"strconv"
+
 	"github.com/labstack/echo/v4"
 	"github.com/maoni/backend-takehome/internal/auth"
 	"github.com/maoni/backend-takehome/internal/payments"
 	"github.com/maoni/backend-takehome/internal/service"
 	"github.com/maoni/backend-takehome/internal/store"
-	"io"
-	"net/http"
-	"strconv"
 )
 
 type Server struct {
@@ -116,15 +117,14 @@ func (s *Server) initializeSubscription(c echo.Context) error {
 	return c.JSON(200, resp)
 }
 func (s *Server) webhook(c echo.Context) error {
-	n := c.Request().ContentLength
-	if n < 0 {
-		n = 0
+	r := c.Request()
+
+	maxReader := http.MaxBytesReader(c.Response().Writer, r.Body, 1<<20)
+	body, err := io.ReadAll(maxReader)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "could not read body"})
 	}
-	body := make([]byte, n)
-	_, err := c.Request().Body.Read(body)
-	if err != nil && err != io.EOF {
-		return c.JSON(400, map[string]string{"error": "could not read body"})
-	}
+
 	if err := s.Subscriptions.HandleWebhook(c.Request().Context(), body, c.Request().Header.Get("x-paystack-signature")); err != nil {
 		if errors.Is(err, payments.ErrInvalidSignature) {
 			return c.JSON(401, map[string]string{"error": "invalid signature"})
