@@ -45,14 +45,34 @@ func main() {
 		return rc.Ping(ctx) == nil
 	}
 
-	httpClient := &http.Client{Timeout: cfg.PaystackTimeout}
-	google := &auth.GoogleVerifier{ClientID: cfg.GoogleClientID, TokenInfoURL: cfg.GoogleTokenInfoURL, HTTPClient: httpClient}
-	paystack := &payments.PaystackClient{SecretKey: cfg.PaystackSecretKey, BaseURL: cfg.PaystackBaseURL, HTTPClient: httpClient}
+	httpClient := &http.Client{
+		Timeout: cfg.PaystackTimeout,
+	}
+	google := &auth.GoogleVerifier{
+		ClientID:     cfg.GoogleClientID,
+		TokenInfoURL: cfg.GoogleTokenInfoURL,
+		HTTPClient:   httpClient,
+	}
+	paystack := &payments.PaystackClient{
+		SecretKey:  cfg.PaystackSecretKey,
+		BaseURL:    cfg.PaystackBaseURL,
+		HTTPClient: httpClient,
+	}
 
 	srv := api.New(
-		&service.BusinessService{Store: st, Cache: businessCache, CacheTTL: cfg.RedisBusinessTTL},
-		&service.AuthService{Store: st, Verifier: google},
-		&service.SubscriptionService{Store: st, Provider: paystack},
+		&service.BusinessService{
+			Store:    st,
+			Cache:    businessCache,
+			CacheTTL: cfg.RedisBusinessTTL,
+		},
+		&service.AuthService{
+			Store:    st,
+			Verifier: google,
+		},
+		&service.SubscriptionService{
+			Store:    st,
+			Provider: paystack,
+		},
 		redisHealthy,
 	)
 	srv.Echo.Server.ReadHeaderTimeout = 5 * time.Second

@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"github.com/maoni/backend-takehome/internal/model"
+	"sync"
 	"time"
 )
 
@@ -22,20 +23,29 @@ func (NoopBusinessCache) SetBusiness(context.Context, model.Business, time.Durat
 }
 func (NoopBusinessCache) DeleteBusiness(context.Context, string) error { return nil }
 
-type MemoryBusinessCache struct{ Items map[string]model.Business }
+type MemoryBusinessCache struct {
+	mu    sync.RWMutex
+	Items map[string]model.Business
+}
 
 func NewMemoryBusinessCache() *MemoryBusinessCache {
 	return &MemoryBusinessCache{Items: map[string]model.Business{}}
 }
 func (m *MemoryBusinessCache) GetBusiness(_ context.Context, id string) (model.Business, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	b, ok := m.Items[id]
 	return b, ok, nil
 }
 func (m *MemoryBusinessCache) SetBusiness(_ context.Context, b model.Business, _ time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.Items[b.ID] = b
 	return nil
 }
 func (m *MemoryBusinessCache) DeleteBusiness(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	delete(m.Items, id)
 	return nil
 }

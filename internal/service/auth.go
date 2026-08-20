@@ -31,5 +31,5 @@ func (s *AuthService) SignInGoogle(ctx context.Context, token string) (model.Use
 	if id.Email == "" {
 		return model.User{}, ErrEmailMissing
 	}
-	return s.Store.UpsertUser(model.User{Email: id.Email, Name: id.Name, GoogleID: id.Subject}), nil
+	return s.Store.UpsertUser(model.User{Email: strings.ToLower(strings.TrimSpace(id.Email)), Name: strings.TrimSpace(id.Name), GoogleID: id.Subject})
 }
