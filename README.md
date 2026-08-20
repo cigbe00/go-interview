@@ -275,3 +275,9 @@ A small, correct, well-tested change will score higher than a large rewrite.
 ## Security and confidentiality
 
 This repository contains no Maoni production data or secrets. Do not add any real production credential to the project. If you choose to use your own provider test credentials for manual exploration, keep them only in your untracked `.env` file.
+
+## Implementation notes
+
+- Google verification uses the configurable token-info endpoint so tests can run against `httptest.Server` without credentials or outbound network access. In production, prefer Google's server-side ID-token/JWK validation library to validate signed tokens locally with cached keys.
+- The Paystack webhook flow currently changes subscription state only for `charge.success`. Unsupported event types are acknowledged without changing state; production support would normally expand to cancellation, renewal, and payment-failure events.
+- Paystack webhook correlation uses the initialized transaction reference and `metadata.user_id`. Email is retained as contact data and is never used as the Maoni account identifier.
